@@ -1,0 +1,541 @@
+package com.example.mobile
+
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.Locale
+import java.util.concurrent.CopyOnWriteArrayList
+
+object GaitBluetoothBridge {
+    private const val ENABLE_TELEMETRY_CSV_RECORDING = false
+    private const val PLOT_FORMAT_COMPACT_V1 = "c1"
+    private const val PLOT_BINARY_HEADER_SIZE = 8
+    private const val PLOT_BINARY_RECORD_SIZE = 18
+    private const val PLOT_BINARY_KIND_SINGLE = 1
+    private const val PLOT_BINARY_KIND_BATCH = 2
+    private val PLOT_BINARY_MAGIC = byteArrayOf(0x47, 0x42, 0x46, 0x31) // "GBF1"
+    private const val STREAM_PLOT_BATCH_SIZE = 10
+    private const val STATE_FORMAT_COMPACT_V1 = "c1"
+    private const val FLAG_PHASE_ACTIVE = 0
+    private const val FLAG_ASSIST_WAIT_NEXT_ZERO = 1
+    private const val FLAG_STAIRS_DOWN_MANUAL_ASSIST = 2
+    private const val FLAG_ASSIST_ENABLED = 3
+    private const val FLAG_ASSIST_ARMED = 4
+    private const val FLAG_ASSIST_OUTPUT_ACTIVE = 5
+    private const val FLAG_MECHANICAL_ZERO_READY = 6
+    private const val FLAG_MOTION_CONFIRMED = 7
+    private const val FLAG_TEST_LEFT_PHASE_VALID = 9
+    private const val FLAG_TEST_RIGHT_PHASE_VALID = 10
+    private const val FLAG_TEST_LEFT_ASSIST_READY = 11
+    private const val FLAG_TEST_RIGHT_ASSIST_READY = 12
+    private const val FLAG_IMU_CONNECTED = 13
+    private const val FLAG_IMU_READY = 14
+    private const val FLAG_IMU_STALE = 15
+
+    private val COMPACT_MODE_KEYS = listOf(
+        "walking",
+        "stairs_up",
+        "stairs_down",
+        "test",
+        "walking_test",
+        "cycling",
+        "uphill",
+        "downhill",
+    )
+
+    data class PlotFrame(
+        val ts: Double,
+        val leftAngle: Float,
+        val rightAngle: Float,
+        val angleDiff: Float,
+        val phase: Float,
+        val assist: Float,
+        val receivedElapsedMs: Long = SystemClock.elapsedRealtime(),
+    )
+
+    data class StateSnapshot(
+        val ts: Double,
+        val motionMode: String,
+        val gaitState: Int,
+        val phaseActive: Boolean,
+        val assistWaitNextZero: Boolean,
+        val manualAssistEnabled: Boolean,
+        val assistEnabled: Boolean,
+        val assistArmed: Boolean,
+        val assistOutputActive: Boolean,
+        val mechanicalZeroReady: Boolean,
+        val motionConfirmed: Boolean,
+        val testLeftPhaseValid: Boolean,
+        val testRightPhaseValid: Boolean,
+        val testLeftAssistReady: Boolean,
+        val testRightAssistReady: Boolean,
+        val detectionScore: Double,
+        val imuConnected: Boolean?,
+        val imuReady: Boolean?,
+        val imuStale: Boolean?,
+        val imuLastError: String?,
+        val imuLabel: String?,
+    )
+
+    private const val TAG = "GaitBluetoothBridge"
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val lock = Any()
+    private val statusListeners = CopyOnWriteArrayList<(String) -> Unit>()
+    private val lineListeners = CopyOnWriteArrayList<(String) -> Unit>()
+    private val stateListeners = CopyOnWriteArrayList<(StateSnapshot) -> Unit>()
+    private val roadConditionListeners = CopyOnWriteArrayList<(String) -> Unit>()
+    @Volatile private var telemetryRecorder: GaitTelemetryCsvRecorder? = null
+    @Volatile private var connector: GaitBluetoothConnector? = null
+    @Volatile private var streamProfileConfiguredForSession = false
+    private var latestPlotFrame: PlotFrame? = null
+    private var latestStateSnapshot: StateSnapshot? = null
+
+    fun getConnector(context: Context): GaitBluetoothConnector {
+        val recorder = if (ENABLE_TELEMETRY_CSV_RECORDING) {
+            telemetryRecorder ?: GaitTelemetryCsvRecorder(context.applicationContext) { message ->
+                for (listener in statusListeners) {
+                    runCatching { listener(message) }
+                        .onFailure { Log.w(TAG, "status listener failed", it) }
+                }
+            }.also { telemetryRecorder = it }
+        } else {
+            null
+        }
+
+        val existing = connector
+        if (existing != null) {
+            return existing
+        }
+        val created = GaitBluetoothConnector(context.applicationContext) { message ->
+            if (message.contains("蓝牙连接已断开")) {
+                streamProfileConfiguredForSession = false
+            } else if (message.startsWith("BLE已连接") || message.startsWith("已连接:")) {
+                streamProfileConfiguredForSession = false
+            }
+            for (listener in statusListeners) {
+                runCatching { listener(message) }
+                    .onFailure { Log.w(TAG, "status listener failed", it) }
+            }
+        }
+        created.setLineCallback { line ->
+            runCatching { handleIncomingLine(line, recorder) }
+                .onFailure { Log.w(TAG, "incoming line dispatch failed", it) }
+        }
+        created.setBinaryFrameCallback { frame ->
+            runCatching { handleIncomingBinaryFrame(frame, recorder) }
+                .onFailure { Log.w(TAG, "incoming binary frame dispatch failed", it) }
+        }
+        connector = created
+        return created
+    }
+
+    fun addStatusListener(listener: (String) -> Unit) {
+        statusListeners.add(listener)
+    }
+
+    fun removeStatusListener(listener: (String) -> Unit) {
+        statusListeners.remove(listener)
+    }
+
+    fun addLineListener(listener: (String) -> Unit) {
+        lineListeners.add(listener)
+    }
+
+    fun removeLineListener(listener: (String) -> Unit) {
+        lineListeners.remove(listener)
+    }
+
+    fun addStateListener(listener: (StateSnapshot) -> Unit) {
+        stateListeners.add(listener)
+        snapshotLatestState()?.let { snapshot ->
+            postOnMain {
+                runCatching { listener(snapshot) }
+                    .onFailure { Log.w(TAG, "initial state listener failed", it) }
+            }
+        }
+    }
+
+    fun removeStateListener(listener: (StateSnapshot) -> Unit) {
+        stateListeners.remove(listener)
+    }
+
+    fun addRoadConditionListener(listener: (String) -> Unit) {
+        roadConditionListeners.add(listener)
+    }
+
+    fun removeRoadConditionListener(listener: (String) -> Unit) {
+        roadConditionListeners.remove(listener)
+    }
+
+    fun snapshotLatestPlotFrame(): PlotFrame? {
+        return synchronized(lock) { latestPlotFrame }
+    }
+
+    fun snapshotLatestState(): StateSnapshot? {
+        return synchronized(lock) { latestStateSnapshot }
+    }
+
+    fun notifyRoadCondition(condition: String) {
+        for (listener in roadConditionListeners) {
+            listener(condition)
+        }
+    }
+
+    fun onInsoleV2Sample(
+        address: String,
+        deviceName: String,
+        insoleTimestamp: Long,
+        footId: Int,
+        values: List<Int>
+    ) {
+        telemetryRecorder?.onInsoleSample(
+            address = address,
+            deviceName = deviceName,
+            insoleTimestamp = insoleTimestamp,
+            footId = footId,
+            values = values
+        )
+    }
+
+    private fun handleIncomingLine(line: String, recorder: GaitTelemetryCsvRecorder?) {
+        val obj = runCatching { JsonParser.parseString(line).asJsonObject }.getOrNull()
+        if (obj == null) {
+            dispatchRawLine(line)
+            return
+        }
+
+        when (GaitProtocol.resolveMessageType(obj)?.lowercase(Locale.US)) {
+            "plot" -> {
+                val frame = obj.toPlotFrame() ?: return
+                acceptPlotFrame(frame, recorder)
+            }
+            "plot_batch" -> {
+                val frames = obj.toPlotFrames()
+                if (frames.isEmpty()) {
+                    return
+                }
+                frames.forEach { frame ->
+                    acceptPlotFrame(frame, recorder)
+                }
+            }
+            "state" -> {
+                val snapshot = obj.toStateSnapshot() ?: return
+                synchronized(lock) {
+                    latestStateSnapshot = snapshot
+                }
+                recorder?.onStateSnapshot(snapshot)
+                dispatchState(snapshot)
+                dispatchRawLine(line)
+            }
+            "pong" -> {
+                ensurePreferredStreamProfile()
+                dispatchRawLine(line)
+            }
+            "ack" -> {
+                val ok = obj.booleanOrNull("ok") ?: obj.booleanOrNull("o") ?: false
+                val message = (
+                    obj.stringOrNull("message")
+                        ?: when (obj.intOrNull("a")) {
+                            1 -> "start_assist"
+                            2 -> "stairs_down_assist"
+                            3 -> "set_stream"
+                            4 -> "mode"
+                            5 -> "params"
+                            else -> ""
+                        }
+                    ).lowercase(Locale.US)
+                if (ok && (message == "mechanical_zero" || message == "system_already_ready")) {
+                    recorder?.onMechanicalZeroAck()
+                }
+                if (ok && message == "set_stream") {
+                    streamProfileConfiguredForSession = true
+                }
+                dispatchRawLine(line)
+            }
+            else -> {
+                dispatchRawLine(line)
+            }
+        }
+    }
+
+    private fun ensurePreferredStreamProfile() {
+        if (streamProfileConfiguredForSession) {
+            return
+        }
+        val activeConnector = connector ?: return
+        if (!activeConnector.isConnected()) {
+            return
+        }
+        val payload = JsonObject().apply {
+            addProperty("t", GaitProtocol.TYPE_SET_STREAM)
+            addProperty("pf", GaitProtocol.STREAM_PLOT_FORMAT_BINARY)
+            addProperty("pm", GaitProtocol.STREAM_PLOT_MODE_BATCH)
+            addProperty("pn", STREAM_PLOT_BATCH_SIZE)
+        }
+        if (activeConnector.sendLine(payload.toString())) {
+            streamProfileConfiguredForSession = true
+        }
+    }
+
+    private fun handleIncomingBinaryFrame(frame: ByteArray, recorder: GaitTelemetryCsvRecorder?) {
+        val parsedFrames = decodeBinaryPlotFrames(frame)
+        if (parsedFrames.isEmpty()) {
+            return
+        }
+        parsedFrames.forEach { plotFrame ->
+            acceptPlotFrame(plotFrame, recorder)
+        }
+    }
+
+    private fun acceptPlotFrame(frame: PlotFrame, recorder: GaitTelemetryCsvRecorder?) {
+        synchronized(lock) {
+            latestPlotFrame = frame
+        }
+        recorder?.onPlotFrame(frame)
+    }
+
+    private fun dispatchRawLine(line: String) {
+        if (lineListeners.isEmpty()) {
+            return
+        }
+        postOnMain {
+            for (listener in lineListeners) {
+                runCatching { listener(line) }
+                    .onFailure { Log.w(TAG, "line listener failed", it) }
+            }
+        }
+    }
+
+    private fun dispatchState(snapshot: StateSnapshot) {
+        if (stateListeners.isEmpty()) {
+            return
+        }
+        postOnMain {
+            for (listener in stateListeners) {
+                runCatching { listener(snapshot) }
+                    .onFailure { Log.w(TAG, "state listener failed", it) }
+            }
+        }
+    }
+
+    private fun postOnMain(action: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            action()
+        } else {
+            mainHandler.post(action)
+        }
+    }
+
+    private fun JsonObject.toPlotFrame(): PlotFrame? {
+        val compact = (
+            stringOrNull("fmt")?.lowercase(Locale.US) == PLOT_FORMAT_COMPACT_V1
+                || (has("l") && has("r") && has("d") && has("p") && has("a"))
+            )
+        val ts = if (compact) doubleOrNull("x") ?: doubleOrNull("t") else doubleOrNull("ts") ?: doubleOrNull("x") ?: doubleOrNull("t")
+        val leftAngle = if (compact) doubleOrNull("l") else doubleOrNull("left_angle") ?: doubleOrNull("l")
+        val rightAngle = if (compact) doubleOrNull("r") else doubleOrNull("right_angle") ?: doubleOrNull("r")
+        val angleDiff = if (compact) doubleOrNull("d") else doubleOrNull("angle_diff") ?: doubleOrNull("d")
+        val phase = if (compact) doubleOrNull("p") else doubleOrNull("phase") ?: doubleOrNull("p")
+        val assist = if (compact) doubleOrNull("a") else doubleOrNull("assist") ?: doubleOrNull("a")
+        if (ts == null || leftAngle == null || rightAngle == null || angleDiff == null || phase == null || assist == null) {
+            return null
+        }
+        return PlotFrame(
+            ts = ts,
+            leftAngle = leftAngle.toFloat(),
+            rightAngle = rightAngle.toFloat(),
+            angleDiff = angleDiff.toFloat(),
+            phase = phase.toFloat(),
+            assist = assist.toFloat(),
+        )
+    }
+
+    private fun JsonObject.toPlotFrames(): List<PlotFrame> {
+        val compact = (
+            stringOrNull("fmt")?.lowercase(Locale.US) == PLOT_FORMAT_COMPACT_V1
+                || has("f")
+            )
+        if (compact) {
+            val compactArray = getAsJsonArray("f") ?: return emptyList()
+            return compactArray.mapNotNull { element ->
+                runCatching {
+                    val row = element.asJsonArray
+                    if (row.size() < 6) return@runCatching null
+                    val ts = row[0].asDouble
+                    val left = row[1].asDouble
+                    val right = row[2].asDouble
+                    val diff = row[3].asDouble
+                    val phase = row[4].asDouble
+                    val assist = row[5].asDouble
+                    PlotFrame(
+                        ts = ts,
+                        leftAngle = left.toFloat(),
+                        rightAngle = right.toFloat(),
+                        angleDiff = diff.toFloat(),
+                        phase = phase.toFloat(),
+                        assist = assist.toFloat(),
+                    )
+                }.getOrNull()
+            }
+        }
+        val array = getAsJsonArray("frames") ?: return emptyList()
+        return array.mapNotNull { element ->
+            runCatching { element.asJsonObject.toPlotFrame() }.getOrNull()
+        }
+    }
+
+    private fun decodeBinaryPlotFrames(frame: ByteArray): List<PlotFrame> {
+        if (frame.size < PLOT_BINARY_HEADER_SIZE) {
+            return emptyList()
+        }
+        if (!frame.hasBinaryMagic()) {
+            return emptyList()
+        }
+        val kind = frame[4].toInt() and 0xFF
+        val count = frame[5].toInt() and 0xFF
+        val payloadLength = (frame[6].toInt() and 0xFF) or ((frame[7].toInt() and 0xFF) shl 8)
+        if (payloadLength <= 0 || frame.size != PLOT_BINARY_HEADER_SIZE + payloadLength) {
+            return emptyList()
+        }
+        if (kind != PLOT_BINARY_KIND_SINGLE && kind != PLOT_BINARY_KIND_BATCH) {
+            return emptyList()
+        }
+        if (count <= 0 || payloadLength != count * PLOT_BINARY_RECORD_SIZE) {
+            return emptyList()
+        }
+        val payload = ByteBuffer.wrap(frame, PLOT_BINARY_HEADER_SIZE, payloadLength)
+            .order(ByteOrder.LITTLE_ENDIAN)
+        val result = ArrayList<PlotFrame>(count)
+        repeat(count) {
+            val tsMs = payload.getLong()
+            val left = payload.getShort().toInt() / 100.0
+            val right = payload.getShort().toInt() / 100.0
+            val diff = payload.getShort().toInt() / 100.0
+            val phase = payload.getShort().toInt() / 1000.0
+            val assist = payload.getShort().toInt() / 100.0
+            result.add(
+                PlotFrame(
+                    ts = tsMs / 1000.0,
+                    leftAngle = left.toFloat(),
+                    rightAngle = right.toFloat(),
+                    angleDiff = diff.toFloat(),
+                    phase = phase.toFloat(),
+                    assist = assist.toFloat(),
+                )
+            )
+        }
+        return result
+    }
+
+    private fun ByteArray.hasBinaryMagic(): Boolean {
+        if (size < PLOT_BINARY_MAGIC.size) {
+            return false
+        }
+        for (idx in PLOT_BINARY_MAGIC.indices) {
+            if (this[idx] != PLOT_BINARY_MAGIC[idx]) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private fun JsonObject.toStateSnapshot(): StateSnapshot? {
+        val compactFlags = intOrNull("f")
+        val compactFormat = stringOrNull("fmt")?.lowercase(Locale.US)
+        val compactMode = GaitProtocol.resolveModeKey(this)
+            ?: intOrNull("mi")?.let { COMPACT_MODE_KEYS.getOrNull(it) }
+        val motionMode = stringOrNull("motion_mode")
+            ?: if (
+                compactFormat == STATE_FORMAT_COMPACT_V1
+                || has("mi")
+                || has("gs")
+                || has("f")
+            ) compactMode else null
+        if (motionMode == null) {
+            return null
+        }
+
+        val assistArmed = booleanOrNull("assist_armed")
+            ?: compactFlags?.hasStateFlag(FLAG_ASSIST_ARMED)
+            ?: false
+        val assistEnabled = booleanOrNull("assist_enabled")
+            ?: compactFlags?.hasStateFlag(FLAG_ASSIST_ENABLED)
+            ?: assistArmed
+
+        return StateSnapshot(
+            ts = doubleOrNull("ts") ?: 0.0,
+            motionMode = motionMode,
+            gaitState = intOrNull("gait_state") ?: intOrNull("gs") ?: 0,
+            phaseActive = booleanOrNull("phase_active")
+                ?: compactFlags?.hasStateFlag(FLAG_PHASE_ACTIVE)
+                ?: false,
+            assistWaitNextZero = booleanOrNull("assist_wait_next_zero")
+                ?: compactFlags?.hasStateFlag(FLAG_ASSIST_WAIT_NEXT_ZERO)
+                ?: false,
+            manualAssistEnabled = booleanOrNull("stairs_down_manual_assist")
+                ?: compactFlags?.hasStateFlag(FLAG_STAIRS_DOWN_MANUAL_ASSIST)
+                ?: false,
+            assistEnabled = assistEnabled,
+            assistArmed = assistArmed,
+            assistOutputActive = booleanOrNull("assist_output_active")
+                ?: compactFlags?.hasStateFlag(FLAG_ASSIST_OUTPUT_ACTIVE)
+                ?: false,
+            mechanicalZeroReady = booleanOrNull("mechanical_zero_ready")
+                ?: compactFlags?.hasStateFlag(FLAG_MECHANICAL_ZERO_READY)
+                ?: false,
+            motionConfirmed = booleanOrNull("motion_confirmed")
+                ?: compactFlags?.hasStateFlag(FLAG_MOTION_CONFIRMED)
+                ?: false,
+            testLeftPhaseValid = booleanOrNull("test_left_phase_valid")
+                ?: compactFlags?.hasStateFlag(FLAG_TEST_LEFT_PHASE_VALID)
+                ?: false,
+            testRightPhaseValid = booleanOrNull("test_right_phase_valid")
+                ?: compactFlags?.hasStateFlag(FLAG_TEST_RIGHT_PHASE_VALID)
+                ?: false,
+            testLeftAssistReady = booleanOrNull("test_left_assist_ready")
+                ?: compactFlags?.hasStateFlag(FLAG_TEST_LEFT_ASSIST_READY)
+                ?: false,
+            testRightAssistReady = booleanOrNull("test_right_assist_ready")
+                ?: compactFlags?.hasStateFlag(FLAG_TEST_RIGHT_ASSIST_READY)
+                ?: false,
+            detectionScore = doubleOrNull("detection_score") ?: doubleOrNull("ds") ?: 0.0,
+            imuConnected = booleanOrNull("imu_connected")
+                ?: compactFlags?.hasStateFlag(FLAG_IMU_CONNECTED),
+            imuReady = booleanOrNull("imu_ready")
+                ?: compactFlags?.hasStateFlag(FLAG_IMU_READY),
+            imuStale = booleanOrNull("imu_stale")
+                ?: compactFlags?.hasStateFlag(FLAG_IMU_STALE),
+            imuLastError = stringOrNull("imu_last_error"),
+            imuLabel = stringOrNull("imu_label"),
+        )
+    }
+
+    private fun Int.hasStateFlag(bit: Int): Boolean {
+        return (this and (1 shl bit)) != 0
+    }
+
+    private fun JsonObject.stringOrNull(key: String): String? {
+        val element = get(key) ?: return null
+        return runCatching { element.asString }.getOrNull()
+    }
+
+    private fun JsonObject.doubleOrNull(key: String): Double? {
+        val element = get(key) ?: return null
+        return runCatching { element.asDouble }.getOrNull()
+    }
+
+    private fun JsonObject.intOrNull(key: String): Int? {
+        val element = get(key) ?: return null
+        return runCatching { element.asInt }.getOrNull()
+    }
+
+    private fun JsonObject.booleanOrNull(key: String): Boolean? {
+        return GaitProtocol.boolOrNull(this, key)
+    }
+}

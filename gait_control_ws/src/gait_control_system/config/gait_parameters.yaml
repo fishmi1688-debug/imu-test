@@ -1,0 +1,30 @@
+# 步态控制参数配置文件
+gait_analysis_node:
+  ros__parameters:
+    control_frequency: 100.0
+    debug_mode: false
+    
+    # 步行模式参数
+    walking:
+      fle_max_amp: 2.5
+      fle_duration: 1.5
+      ext_max_amp: 5.0
+    
+    # 上楼梯模式参数
+    stairs_up:
+      fle_max_amp: 3.5
+      fle_duration: 2.0
+      ext_max_amp: 8.0
+    
+    # 下楼梯模式参数
+    stairs_down:
+      fle_max_amp: 2.0
+      fle_duration: 1.0
+      ext_max_amp: 6.0
+
+motor_controller:
+  ros__parameters:
+    can_interface: 'can0'
+    update_rate: 100.0
+    max_current: 27.0
+    torque_constant: 0.87

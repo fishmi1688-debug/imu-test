@@ -1,0 +1,4 @@
+[console_scripts]
+gait_control_node = gait_control_system.last3_optimized:main
+last3_optimized = gait_control_system.last3_optimized:main
+

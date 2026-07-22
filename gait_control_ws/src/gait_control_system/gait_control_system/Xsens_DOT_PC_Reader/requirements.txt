@@ -1,0 +1,3 @@
+bleak
+numpy
+# UI uses tkinter from the Python stdlib; on Linux install python3-tk if missing.

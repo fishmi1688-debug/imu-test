@@ -1,0 +1,40 @@
+# Python (pip) requirements for gait_control_system
+# Note: ROS packages (rclpy, std_msgs, sensor_msgs, geometry_msgs) are provided by the ROS 2 installation
+# and should be installed via your ROS distro packages (apt) or colcon/ros workspace. Do not pip-install core ROS packages.
+
+# Runtime dependencies (install with pip in a virtualenv for non-ROS use or when running tests)
+numpy
+PyYAML
+matplotlib
+
+# Bluetooth / BLE runtime dependencies
+# BLE Notify / GATT peripheral on Linux requires BlueZ + D-Bus + GObject introspection.
+# Install system packages first, otherwise dbus-python / PyGObject may fail to build or import:
+#   sudo apt update
+#   sudo apt install -y bluez bluetooth bluez-tools rfkill dbus python3-dbus python3-gi gir1.2-glib-2.0
+# Optional build headers if installing these via pip in a venv:
+#   sudo apt install -y libdbus-1-dev libglib2.0-dev libcairo2-dev pkg-config python3-dev
+# IMU / Movella DOT client code uses bleak directly.
+bleak>=0.22.1
+dbus-python>=1.3.2
+PyGObject>=3.42.0
+bluezero>=0.9.1
+
+# Optional / dev dependencies
+pytest
+
+# If you plan to build binary wheels or compile C extensions
+wheel
+
+# CAN bus related Python packages
+# Note: working with CAN typically also requires system-level support (SocketCAN on Linux),
+# can-utils, and appropriate kernel drivers or USB-CAN adapter drivers. Install those via
+# your package manager (apt) or the vendor instructions. Example on Ubuntu:
+#   sudo apt install can-utils
+#   sudo modprobe can raw can_dev
+# For some adapters you may need vendor-specific drivers.
+
+python-can>=4.0
+cantools>=36.0.0
+canopen>=3.1.0
+isotp>=1.2.0

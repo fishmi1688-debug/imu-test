@@ -1,0 +1,15 @@
+setup.py
+movella_dot_py/__init__.py
+movella_dot_py.egg-info/PKG-INFO
+movella_dot_py.egg-info/SOURCES.txt
+movella_dot_py.egg-info/dependency_links.txt
+movella_dot_py.egg-info/requires.txt
+movella_dot_py.egg-info/top_level.txt
+movella_dot_py/core/__init__.py
+movella_dot_py/core/collector.py
+movella_dot_py/core/parser.py
+movella_dot_py/core/sensor.py
+movella_dot_py/models/__init__.py
+movella_dot_py/models/characteristics.py
+movella_dot_py/models/data_structures.py
+movella_dot_py/models/enums.py

@@ -1,0 +1,25 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- 基础主题 -->
+    <style name="Theme.IMUMotionRecorder" parent="Theme.Material3.DayNight.NoActionBar">
+<!--        &lt;!&ndash; 主色调 &ndash;&gt;-->
+<!--        <item name="colorPrimary">@color/blue</item>-->
+<!--        <item name="colorPrimaryVariant">@color/blue</item>-->
+<!--        <item name="colorOnPrimary">@color/white</item>-->
+<!--        &lt;!&ndash; 次要色调 &ndash;&gt;-->
+<!--        <item name="colorSecondary">@color/green</item>-->
+<!--        <item name="colorSecondaryVariant">@color/green</item>-->
+<!--        <item name="colorOnSecondary">@color/white</item>-->
+<!--        &lt;!&ndash; 背景色 &ndash;&gt;-->
+<!--        <item name="android:windowBackground" tools:targetApi="l">?android:attr/colorBackground</item>-->
+<!--        <item name="android:colorBackground">@color/white</item>-->
+<!--        &lt;!&ndash; 文本颜色 &ndash;&gt;-->
+<!--        <item name="android:textColorPrimary">@color/black</item>-->
+<!--        <item name="android:textColorSecondary">@color/gray</item>-->
+<!--        &lt;!&ndash; 按钮样式 &ndash;&gt;-->
+<!--        <item name="materialButtonStyle">@style/Widget.MaterialComponents.Button</item>-->
+        <item name="materialButtonOutlinedStyle">@style/Widget.App.Button.OutlinedButton</item>
+    </style>
+    <style name="Widget.App.Button.OutlinedButton" parent="Widget.MaterialComponents.Button.OutlinedButton">
+        <item name="strokeColor">@color/button_stroke_color_selector</item>
+    </style>
+</resources>

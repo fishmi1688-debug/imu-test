@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@android:color/white"
+    android:orientation="vertical"
+    android:paddingTop="8dp">
+
+    <TextView
+        android:id="@+id/insoleHintView"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="8dp"
+        android:background="@android:color/white"
+        android:text="@string/insole_dialog_hint"
+        android:textColor="@android:color/black"
+        android:textSize="13sp" />
+
+    <TextView
+        android:id="@+id/insoleEmptyView"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@android:color/white"
+        android:gravity="center_horizontal"
+        android:paddingVertical="14dp"
+        android:text="@string/insole_dialog_scanning"
+        android:textColor="@android:color/darker_gray"
+        android:textSize="13sp" />
+
+    <ListView
+        android:id="@+id/insoleDeviceListView"
+        android:layout_width="match_parent"
+        android:layout_height="300dp"
+        android:background="@android:color/white"
+        android:cacheColorHint="@android:color/white"
+        android:choiceMode="none"
+        android:drawSelectorOnTop="false"
+        android:listSelector="@android:color/transparent"
+        android:dividerHeight="8dp" />
+
+</LinearLayout>

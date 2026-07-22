@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: movella_dot_py
+Version: 0.1
+Requires-Dist: bleak
+Requires-Dist: numpy
+Dynamic: requires-dist
