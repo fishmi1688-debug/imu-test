@@ -95,6 +95,14 @@ CONTROL_FIELD_STATE_GAIT = 42
 CONTROL_FIELD_STATE_FLAGS = 43
 CONTROL_FIELD_STATE_SCORE = 44
 CONTROL_FIELD_STATE_PARAMS = 45
+CONTROL_FIELD_IMU_PHASE_LEFT_CONNECTED = 46
+CONTROL_FIELD_IMU_PHASE_LEFT_MEASURING = 47
+CONTROL_FIELD_IMU_PHASE_LEFT_READY = 48
+CONTROL_FIELD_IMU_PHASE_LEFT_STALE = 49
+CONTROL_FIELD_IMU_PHASE_RIGHT_CONNECTED = 50
+CONTROL_FIELD_IMU_PHASE_RIGHT_MEASURING = 51
+CONTROL_FIELD_IMU_PHASE_RIGHT_READY = 52
+CONTROL_FIELD_IMU_PHASE_RIGHT_STALE = 53
 FLAG_PHASE_ACTIVE = 0
 FLAG_ASSIST_ENABLED = 3
 FLAG_ASSIST_ARMED = 4
@@ -116,6 +124,8 @@ MODE_KEYS = [
     "cycling",
     "uphill",
     "downhill",
+    "imu_phase",
+    "imu_left_phase",
 ]
 
 
@@ -272,9 +282,16 @@ def _build_control_response_frame(payload_obj: dict) -> Optional[bytes]:
         fields.append((field_id, CONTROL_TYPE_FLOAT32, _pack_f32(value)))
 
     def add_bool(field_id: int, key: str) -> None:
-        if key not in payload_obj:
+        add_bool_any(field_id, key)
+
+    def add_bool_any(field_id: int, *keys: str) -> None:
+        value = None
+        for key in keys:
+            if key in payload_obj:
+                value = payload_obj.get(key)
+                break
+        else:
             return
-        value = payload_obj.get(key)
         if isinstance(value, bool):
             out = 1 if value else 0
         else:
@@ -307,6 +324,14 @@ def _build_control_response_frame(payload_obj: dict) -> Optional[bytes]:
     add_i32(CONTROL_FIELD_STATE_FLAGS, "f")
     add_f32(CONTROL_FIELD_STATE_SCORE, "ds")
     add_i32(CONTROL_FIELD_COMMAND, "c")
+    add_bool_any(CONTROL_FIELD_IMU_PHASE_LEFT_CONNECTED, "iplc", "imu_phase_left_connected")
+    add_bool_any(CONTROL_FIELD_IMU_PHASE_LEFT_MEASURING, "iplq", "imu_phase_left_measuring")
+    add_bool_any(CONTROL_FIELD_IMU_PHASE_LEFT_READY, "ipld", "imu_phase_left_ready")
+    add_bool_any(CONTROL_FIELD_IMU_PHASE_LEFT_STALE, "iplz", "imu_phase_left_stale")
+    add_bool_any(CONTROL_FIELD_IMU_PHASE_RIGHT_CONNECTED, "iprc", "imu_phase_right_connected")
+    add_bool_any(CONTROL_FIELD_IMU_PHASE_RIGHT_MEASURING, "iprq", "imu_phase_right_measuring")
+    add_bool_any(CONTROL_FIELD_IMU_PHASE_RIGHT_READY, "iprd", "imu_phase_right_ready")
+    add_bool_any(CONTROL_FIELD_IMU_PHASE_RIGHT_STALE, "iprz", "imu_phase_right_stale")
 
     if "u" in payload_obj:
         raw_updates = _encode_param_updates_bytes(payload_obj.get("u"))
@@ -592,6 +617,7 @@ class BluetoothBleNotifyServer:
         self._send_queue_max_items = _env_int("GAIT_BT_SEND_QUEUE_MAX", DEFAULT_SEND_QUEUE_MAX_ITEMS)
         self._dropped_soft_realtime_items = 0
         self._notify_session_id = 0
+        self._handshake_logged = False
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -604,6 +630,7 @@ class BluetoothBleNotifyServer:
         self._stop_event.set()
         self._client_connected.clear()
         self._notifications_enabled.clear()
+        self._handshake_logged = False
         with self._send_lock:
             self._notify_session_id += 1
             self._send_queue.clear()
@@ -822,6 +849,7 @@ class BluetoothBleNotifyServer:
     def _on_disconnect(self, device, *args) -> None:
         self._client_connected.clear()
         self._notifications_enabled.clear()
+        self._handshake_logged = False
         with self._send_lock:
             self._notify_session_id += 1
             self._send_queue.clear()
@@ -837,6 +865,7 @@ class BluetoothBleNotifyServer:
                 self._notify_session_id += 1
                 self._send_queue.clear()
                 self._send_scheduled = False
+            self._handshake_logged = False
             self._notifications_enabled.set()
             self._client_connected.set()
             self._log_info("✅ 已启用BLE Notify，准备发送数据")
@@ -844,6 +873,7 @@ class BluetoothBleNotifyServer:
         else:
             self._notifications_enabled.clear()
             self._client_connected.clear()
+            self._handshake_logged = False
             with self._send_lock:
                 self._notify_session_id += 1
                 self._send_queue.clear()
@@ -874,7 +904,9 @@ class BluetoothBleNotifyServer:
         if response:
             self.send_line(response)
         if decoded_payload is not None and int(decoded_payload.get("t", 0)) == 1:
-            self._log_info("🤝 BLE握手完成，允许发送plot/state")
+            if not self._handshake_logged:
+                self._handshake_logged = True
+                self._log_info("🤝 BLE握手完成，允许发送plot/state")
 
 
 def build_default_server(

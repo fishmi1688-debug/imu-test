@@ -15,7 +15,8 @@ data class GaitMotionMode(
     val phaseBias: Double,
     val phaseBiasAt0p6: Double,
     val phaseBiasSlope: Double,
-    val eventProbThreshold: Double
+    val eventProbThreshold: Double,
+    val swingThreshold: Double
 )
 
 object GaitMotionModes {
@@ -35,7 +36,8 @@ object GaitMotionModes {
             phaseBias = -0.20,
             phaseBiasAt0p6 = -0.20,
             phaseBiasSlope = 1.0,
-            eventProbThreshold = 0.8
+            eventProbThreshold = 0.8,
+            swingThreshold = 25.0
         ),
         GaitMotionMode(
             key = "stairs_up",
@@ -52,7 +54,8 @@ object GaitMotionModes {
             phaseBias = 0.0,
             phaseBiasAt0p6 = 0.0,
             phaseBiasSlope = 0.0,
-            eventProbThreshold = 0.8
+            eventProbThreshold = 0.8,
+            swingThreshold = 25.0
         ),
         GaitMotionMode(
             key = "stairs_down",
@@ -69,7 +72,8 @@ object GaitMotionModes {
             phaseBias = 0.0,
             phaseBiasAt0p6 = 0.0,
             phaseBiasSlope = 0.0,
-            eventProbThreshold = 0.8
+            eventProbThreshold = 0.8,
+            swingThreshold = 25.0
         ),
         GaitMotionMode(
             key = "test",
@@ -86,7 +90,8 @@ object GaitMotionModes {
             phaseBias = 0.0,
             phaseBiasAt0p6 = 0.0,
             phaseBiasSlope = 0.0,
-            eventProbThreshold = 0.8
+            eventProbThreshold = 0.8,
+            swingThreshold = 25.0
         ),
         GaitMotionMode(
             key = "walking_test",
@@ -103,7 +108,8 @@ object GaitMotionModes {
             phaseBias = 0.12,
             phaseBiasAt0p6 = 0.0,
             phaseBiasSlope = 0.0,
-            eventProbThreshold = 0.8
+            eventProbThreshold = 0.8,
+            swingThreshold = 25.0
         ),
         GaitMotionMode(
             key = "cycling",
@@ -120,7 +126,8 @@ object GaitMotionModes {
             phaseBias = 0.06,
             phaseBiasAt0p6 = 0.06,
             phaseBiasSlope = 1.0,
-            eventProbThreshold = 0.8
+            eventProbThreshold = 0.8,
+            swingThreshold = 25.0
         ),
         GaitMotionMode(
             key = "uphill",
@@ -137,7 +144,8 @@ object GaitMotionModes {
             phaseBias = 0.0,
             phaseBiasAt0p6 = 0.0,
             phaseBiasSlope = 0.0,
-            eventProbThreshold = 0.8
+            eventProbThreshold = 0.8,
+            swingThreshold = 25.0
         ),
         GaitMotionMode(
             key = "downhill",
@@ -154,7 +162,44 @@ object GaitMotionModes {
             phaseBias = -0.20,
             phaseBiasAt0p6 = 0.0,
             phaseBiasSlope = 0.0,
-            eventProbThreshold = 0.8
+            eventProbThreshold = 0.8,
+            swingThreshold = 25.0
+        ),
+        GaitMotionMode(
+            key = "imu_phase",
+            name = "有线IMU相位模式",
+            description = "使用左右有线大腿IMU生成相位，助力曲线沿用步行测试参数，手动启停",
+            extT0 = 0.0,
+            extTf = 0.30,
+            extP = 0.70,
+            extTmax = 5.0,
+            flexT0 = 0.50,
+            flexTf = 0.80,
+            flexP = 0.80,
+            flexTmax = 5.0,
+            phaseBias = 0.12,
+            phaseBiasAt0p6 = 0.0,
+            phaseBiasSlope = 0.0,
+            eventProbThreshold = 0.8,
+            swingThreshold = 25.0
+        ),
+        GaitMotionMode(
+            key = "imu_left_phase",
+            name = "左有线IMU相位模式",
+            description = "使用左有线大腿IMU生成左腿相位，右腿相位=左腿相位+pi，手动启停",
+            extT0 = 0.0,
+            extTf = 0.30,
+            extP = 0.70,
+            extTmax = 5.0,
+            flexT0 = 0.50,
+            flexTf = 0.80,
+            flexP = 0.80,
+            flexTmax = 5.0,
+            phaseBias = 0.12,
+            phaseBiasAt0p6 = 0.0,
+            phaseBiasSlope = 0.0,
+            eventProbThreshold = 0.8,
+            swingThreshold = 25.0
         )
     )
 

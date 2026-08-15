@@ -43,7 +43,10 @@ class GaitParameterActivity : AppCompatActivity() {
             "cycling",
             "uphill",
             "downhill",
+            "imu_phase",
+            "imu_left_phase",
         )
+        private val IMU_PHASE_MODE_KEYS = setOf("imu_phase", "imu_left_phase")
     }
 
     private data class ParamSpec(
@@ -71,7 +74,8 @@ class GaitParameterActivity : AppCompatActivity() {
         "phase_bias" to ParamSpec(min = -1.0, max = 1.0, step = 0.01, decimals = 3),
         "phase_bias_at_0p6" to ParamSpec(min = -1.0, max = 1.0, step = 0.01, decimals = 3),
         "phase_bias_slope" to ParamSpec(min = -10.0, max = 10.0, step = 0.05, decimals = 3),
-        "event_prob_threshold" to ParamSpec(min = 0.0, max = 1.0, step = 0.05, decimals = 2)
+        "event_prob_threshold" to ParamSpec(min = 0.0, max = 1.0, step = 0.05, decimals = 2),
+        "swing_threshold" to ParamSpec(min = 0.0, max = 90.0, step = 1.0, decimals = 1)
     )
 
     private val paramValues = mutableMapOf<String, Double>()
@@ -112,7 +116,10 @@ class GaitParameterActivity : AppCompatActivity() {
     }
 
     private fun isManualToggleMode(modeKey: String): Boolean {
-        return modeKey == "stairs_down" || modeKey == "test" || modeKey == "walking_test"
+        return modeKey == "stairs_down" ||
+            modeKey == "test" ||
+            modeKey == "walking_test" ||
+            modeKey in IMU_PHASE_MODE_KEYS
     }
 
     private fun manualToggleModeLabel(modeKey: String): String {
@@ -120,6 +127,8 @@ class GaitParameterActivity : AppCompatActivity() {
             "stairs_down" -> "下楼梯"
             "test" -> "骑车测试模式"
             "walking_test" -> "步行测试模式"
+            "imu_phase" -> "有线IMU相位模式"
+            "imu_left_phase" -> "左有线IMU相位模式"
             else -> "手动模式"
         }
     }
@@ -232,7 +241,16 @@ class GaitParameterActivity : AppCompatActivity() {
             if (action == GaitProtocol.ACTION_START_ASSIST) {
                 if (!ok) {
                     val reasonCode = obj.intOrNull("r") ?: -1
-                    showStatus("开始命令执行失败: ${GaitProtocol.formatReasonCode(reasonCode)}")
+                    val detail = obj.stringOrNull("err")?.takeIf { it.isNotBlank() }
+                        ?: if (reasonCode == 19) {
+                            "有线IMU数据频率未达到50Hz，请检查IMU设备供电、CAN连接、终端电阻、can接口状态和帧ID配置"
+                        } else {
+                            null
+                        }
+                    val detailText = if (detail != null) "，$detail" else ""
+                    showStatus(
+                        "开始命令执行失败: ${GaitProtocol.formatReasonCode(reasonCode)}$detailText"
+                    )
                     return
                 }
                 val ackMode = obj.intOrNull("m")?.let(GaitProtocol::modeKeyFromCode) ?: currentModeKey
@@ -480,6 +498,11 @@ class GaitParameterActivity : AppCompatActivity() {
             plusButton = findViewById(R.id.rTPlusButton),
             valueView = findViewById(R.id.rTValueView)
         )
+        paramViews["swing_threshold"] = ParamViews(
+            minusButton = findViewById(R.id.swingThresholdMinusButton),
+            plusButton = findViewById(R.id.swingThresholdPlusButton),
+            valueView = findViewById(R.id.swingThresholdValueView)
+        )
 
         for ((key, views) in paramViews) {
             configureAdjustButton(views.minusButton, "-")
@@ -579,13 +602,17 @@ class GaitParameterActivity : AppCompatActivity() {
             return
         }
         val modeName = GaitMotionModes.byKey[currentModeKey]?.name ?: currentModeKey
-        val hint = "请求开始传输并启动系统（同时重新使能电机、设置50Hz主动上报并执行标零；助力由手动启停或IMU判定触发）"
+        val hint = if (currentModeKey in IMU_PHASE_MODE_KEYS) {
+            "请求开始传输并启动系统（先检查有线IMU 50Hz数据；通过后重新使能电机但不启用电机主动上报，执行标零；助力由手动启停触发）"
+        } else {
+            "请求开始传输并启动系统（同时重新使能电机、设置50Hz主动上报并执行标零；助力由手动启停或IMU判定触发）"
+        }
         showStatus("$modeName $hint")
     }
 
     private fun sendStairsDownAssistToggle() {
         if (!isManualToggleMode(currentModeKey)) {
-            showStatus("请先切换到下楼梯、骑车测试模式或步行测试模式")
+            showStatus("请先切换到下楼梯、骑车测试模式、步行测试模式或IMU相位模式")
             return
         }
         val targetEnabled = !stairsDownAssistEnabled
@@ -623,10 +650,13 @@ class GaitParameterActivity : AppCompatActivity() {
         currentModeKey = modeKey
         val interpolationEnabled = modeKey == "walking" || modeKey == "cycling"
         val eventThresholdEnabled = modeKey == "cycling" || modeKey == "uphill"
+        val swingThresholdVisible = modeKey in IMU_PHASE_MODE_KEYS
         val stairsDownManualToggleVisible = isManualToggleMode(modeKey)
         setRowEnabled(findViewById(R.id.phaseBias0p6Row), interpolationEnabled)
         setRowEnabled(findViewById(R.id.phaseBiasSlopeRow), interpolationEnabled)
         setRowEnabled(findViewById(R.id.eventProbThresholdRow), eventThresholdEnabled)
+        findViewById<View>(R.id.swingThresholdRow).visibility =
+            if (swingThresholdVisible) View.VISIBLE else View.GONE
         stairsDownToggleCard.visibility = if (stairsDownManualToggleVisible) View.VISIBLE else View.GONE
         setStairsDownAssistEnabled(if (stairsDownManualToggleVisible) manualAssistEnabled else false)
     }
@@ -732,6 +762,7 @@ class GaitParameterActivity : AppCompatActivity() {
         setParamValue("phase_bias_at_0p6", values["phase_bias_at_0p6"] ?: 0.0, updatePreview = false)
         setParamValue("phase_bias_slope", values["phase_bias_slope"] ?: 0.0, updatePreview = false)
         setParamValue("event_prob_threshold", values["event_prob_threshold"] ?: 0.0, updatePreview = false)
+        setParamValue("swing_threshold", values["swing_threshold"] ?: 25.0, updatePreview = false)
 
         updateModeUiState(modeKey, manualAssistEnabled)
         updateAssistCurvePreview()
@@ -756,7 +787,8 @@ class GaitParameterActivity : AppCompatActivity() {
             "phase_bias" to mode.phaseBias,
             "phase_bias_at_0p6" to mode.phaseBiasAt0p6,
             "phase_bias_slope" to mode.phaseBiasSlope,
-            "event_prob_threshold" to mode.eventProbThreshold
+            "event_prob_threshold" to mode.eventProbThreshold,
+            "swing_threshold" to mode.swingThreshold
         )
     }
 

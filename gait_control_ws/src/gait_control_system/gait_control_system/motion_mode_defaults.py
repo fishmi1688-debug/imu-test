@@ -13,6 +13,8 @@ from .phase_bias_fitting import (
     WALKING_LINEAR_SLOPE,
 )
 
+DEFAULT_IMU_PHASE_SWING_THRESHOLD_DEG = 25.0
+
 # 基础默认参数（不要在其他模块直接修改此字典）
 _BASE_MOTION_MODES: Dict[str, Dict[str, Any]] = {
     "walking": {
@@ -150,9 +152,50 @@ _BASE_MOTION_MODES: Dict[str, Dict[str, Any]] = {
         "phase_bias_slope": 0.0,
         "description": "适用于下坡行走",
     },
+    "imu_phase": {
+        "name": "有线IMU相位模式",
+        "name_en": "Wired IMU Phase",
+        # 助力曲线沿用 walking_test 默认参数，仅相位来源切换为左右有线大腿IMU。
+        "ext_t0": 0.00,
+        "ext_tf": 0.30,
+        "ext_p": 0.70,
+        "ext_Tmax": 5.0,
+        "flex_t0": 0.50,
+        "flex_tf": 0.80,
+        "flex_p": 0.80,
+        "flex_Tmax": 5.0,
+        "phase_bias": 0.12,
+        "phase_bias_at_0p6": 0.0,
+        "phase_bias_slope": 0.0,
+        "event_prob_threshold": 0.8,
+        "swing_threshold": DEFAULT_IMU_PHASE_SWING_THRESHOLD_DEG,
+        "description": "使用左右有线大腿IMU生成相位，助力曲线沿用步行测试参数，手动启停",
+    },
+    "imu_left_phase": {
+        "name": "左有线IMU相位模式",
+        "name_en": "Left Wired IMU Phase",
+        # 助力曲线沿用 walking_test 默认参数，仅相位来源切换为左有线大腿IMU。
+        "ext_t0": 0.00,
+        "ext_tf": 0.30,
+        "ext_p": 0.70,
+        "ext_Tmax": 5.0,
+        "flex_t0": 0.50,
+        "flex_tf": 0.80,
+        "flex_p": 0.80,
+        "flex_Tmax": 5.0,
+        "phase_bias": 0.12,
+        "phase_bias_at_0p6": 0.0,
+        "phase_bias_slope": 0.0,
+        "event_prob_threshold": 0.8,
+        "swing_threshold": DEFAULT_IMU_PHASE_SWING_THRESHOLD_DEG,
+        "description": "使用左有线大腿IMU生成左腿相位，右腿相位=左腿相位+pi，手动启停",
+    },
 }
 
 
 def get_default_motion_modes() -> Dict[str, Dict[str, Any]]:
     """返回一份全新的默认参数拷贝，避免跨模块共享同一实例。"""
-    return deepcopy(_BASE_MOTION_MODES)
+    modes = deepcopy(_BASE_MOTION_MODES)
+    for params in modes.values():
+        params.setdefault("swing_threshold", DEFAULT_IMU_PHASE_SWING_THRESHOLD_DEG)
+    return modes

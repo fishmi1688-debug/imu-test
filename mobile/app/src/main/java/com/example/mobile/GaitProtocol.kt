@@ -47,6 +47,8 @@ object GaitProtocol {
         "cycling",
         "uphill",
         "downhill",
+        "imu_phase",
+        "imu_left_phase",
     )
 
     private val messageTypeCodeToText = mapOf(
@@ -79,6 +81,8 @@ object GaitProtocol {
     private val imuSlotCodeToText = mapOf(
         0 to "walking",
         1 to "cycling",
+        2 to "imu_phase_left",
+        3 to "imu_phase_right",
     )
 
     private val reasonCodeToText = mapOf(
@@ -100,6 +104,8 @@ object GaitProtocol {
         15 to "unknown_type",
         16 to "imu_control_failed",
         17 to "invalid_slot",
+        18 to "motor_feedback_timeout",
+        19 to "imu_rate_check_failed",
     )
 
     private val paramKeys = listOf(
@@ -115,6 +121,7 @@ object GaitProtocol {
         "phase_bias_at_0p6",
         "phase_bias_slope",
         "event_prob_threshold",
+        "swing_threshold",
     )
 
     fun resolveMessageType(obj: JsonObject): String? {

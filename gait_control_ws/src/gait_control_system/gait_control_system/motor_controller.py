@@ -515,12 +515,14 @@ class MotorController(Node):
             torque=torque,
         )
 
-    def enable_motor(self, motor_id):
-        report_ok = self.set_active_report(
-            motor_id,
-            enabled=True,
-            report_hz=self.active_report_target_hz,
-        )
+    def enable_motor(self, motor_id, active_report=True):
+        report_ok = True
+        if active_report:
+            report_ok = self.set_active_report(
+                motor_id,
+                enabled=True,
+                report_hz=self.active_report_target_hz,
+            )
         frame = self._make_can_frame(
             RS01_ENABLE_FUNCTION_ID,
             motor_id,
@@ -530,8 +532,9 @@ class MotorController(Node):
         enable_ok = self.send_frame(frame)
         ok = bool(report_ok and enable_ok)
         if ok:
+            report_text = "并打开主动上报" if active_report else "但不打开主动上报"
             self.get_logger().info(
-                f"🔌 电机已使能并打开主动上报: {self._motor_label(motor_id)} "
+                f"🔌 电机已使能{report_text}: {self._motor_label(motor_id)} "
                 f"(enable=0x{frame.arbitration_id:08X})"
             )
         else:

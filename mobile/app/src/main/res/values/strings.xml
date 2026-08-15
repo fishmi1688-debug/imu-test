@@ -94,7 +94,7 @@
     <string name="ui_text_077">角度差 (rad)</string>
     <string name="ui_text_078">相位 (rad)</string>
     <string name="ui_text_079">助力 (Nm)</string>
-    <string name="ui_text_080">角度差/相位/助力实时曲线</string>
+    <string name="ui_text_080">左右关节角度/角度差/相位/助力实时曲线</string>
     <string name="ui_text_081">左右关节角度 (rad)</string>
     <string name="ui_text_082">电机使能</string>
     <string name="ui_text_083">机械标零</string>
@@ -109,11 +109,13 @@
     <string name="ui_text_092">蓝线为总助力，绿线为伸展，橙线为屈曲。当前总峰值 %1$s Nm，伸展 %2$s Nm，屈曲 %3$s Nm，相位偏置 %4$s。</string>
     <string name="ui_text_093">暂无助力曲线</string>
     <string name="ui_text_094">下楼梯/测试手动启停</string>
-    <string name="ui_text_095">下楼梯与测试模式不使用IMU模型判停；“开始传输并启动系统”仅启动系统，不会直接开助力，请使用此按钮手动启停助力。</string>
+    <string name="ui_text_095">下楼梯、测试与IMU相位类模式不使用IMU模型自动判停；“开始传输并启动系统”仅启动系统，不会直接开助力，请使用此按钮手动启停助力。</string>
     <string name="ui_text_096">开始手动助力</string>
     <string name="ui_text_097">停止手动助力</string>
-    <string name="ui_text_098">点击开始后会重新使能电机、配置 50Hz 主动上报、执行机械标零并启动系统传输；是否输出助力由手动启停按钮或IMU运动判定决定，开始按钮本身不会直接给助力。</string>
+    <string name="ui_text_098">点击开始后会重新使能电机、执行机械标零并启动系统传输；普通模式会配置并检查电机 50Hz 主动上报，IMU相位类模式不启用也不检查电机主动上报。是否输出助力由手动启停按钮或IMU运动判定决定。</string>
     <string name="ui_text_099">开始传输并启动系统</string>
+    <string name="ui_text_100">IMU相位参数</string>
+    <string name="ui_text_101">摆幅阈值 (deg)</string>
     <string name="api_config_button">API参数设置</string>
     <string name="api_config_title">路况分析API参数</string>
     <string name="api_config_hint">可修改 Base URL、API Key 与模型名（例如 qwen3-vl-flash），保存后立即生效。</string>
@@ -156,11 +158,14 @@
     <string name="insole_action_disconnect">断开</string>
     <string name="insole_device_line">%1$s\n%2$s | RSSI %3$s</string>
     <string name="imu_manage_title">IMU连接管理</string>
-    <string name="imu_manage_hint">管理两个 IMU（左大腿、左脚）：左侧可修改名称，右侧开关控制 gait 端连接；点击地址输入 MAC。</string>
-    <string name="imu_manage_slot_default_1">左大腿 IMU</string>
-    <string name="imu_manage_slot_default_2">左脚 IMU</string>
-    <string name="imu_manage_slot_default_3">左脚 IMU</string>
+    <string name="imu_manage_hint">管理 gait 侧 IMU：walking/cycling 槽位仍使用蓝牙 IMU；IMU相位左/右腿改由 PC 端有线 CAN IMU 提供，不需要填写 MAC。</string>
+    <string name="imu_manage_slot_default_1">walking IMU</string>
+    <string name="imu_manage_slot_default_2">cycling IMU</string>
+    <string name="imu_manage_slot_default_3">有线IMU相位左腿</string>
+    <string name="imu_manage_slot_default_4">有线IMU相位右腿</string>
     <string name="imu_manage_unbound">设备: 未绑定（点击此行输入 MAC）</string>
+    <string name="imu_manage_wired_can_line">设备: PC端有线 CAN IMU（由 gait 端配置）</string>
+    <string name="imu_manage_wired_can_line_connected">设备: PC端有线 CAN IMU（已连接）</string>
     <string name="imu_manage_scan_title">选择 IMU 设备</string>
     <string name="imu_manage_scan_title_with_slot">选择 IMU 设备（%1$s）</string>
     <string name="imu_manage_save">保存</string>
@@ -254,4 +259,5 @@
     <string name="value_default_0_00">0.00</string>
     <string name="value_default_0_30">0.30</string>
     <string name="value_default_0_50">0.50</string>
+    <string name="value_default_25_0">25.0</string>
 </resources>

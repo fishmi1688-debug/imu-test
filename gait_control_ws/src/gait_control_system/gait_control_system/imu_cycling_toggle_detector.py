@@ -130,9 +130,13 @@ class CyclingToggleIMUDetector(IMUModelStartStopDetector):
 
     def _handle_sample(self, sample_6d: np.ndarray) -> None:
         with self._lock:
-            self._sample_buffer.append(sample_6d)
+            now = time.time()
+            sample = np.asarray(sample_6d, dtype=float).copy()
+            self._latest_sample_6d = sample
+            self._latest_sample_seq += 1
+            self._sample_buffer.append(sample)
             self._sample_seq += 1
-            self._last_sample_time = time.time()
+            self._last_sample_time = now
 
             if len(self._sample_buffer) < self._window_size:
                 self._last_prediction["ready"] = False

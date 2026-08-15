@@ -81,6 +81,15 @@ if [ $? -ne 0 ]; then
 fi
 # 确保Python可以找到源码包（使用相对import的模块）
 export PYTHONPATH="$PWD/src:$PWD/src/gait_control_system:${PYTHONPATH}"
+# 有线IMU和电机共用同一个SocketCAN接口，默认都走 can0。
+export GAIT_IMU_PHASE_CAN_INTERFACE="${GAIT_IMU_PHASE_CAN_INTERFACE:-$CAN_INTERFACE}"
+# 有线IMU不再阻塞APP BLE启动；开始助力时仍会按模式检查IMU数据流。
+export GAIT_IMU_PHASE_PRECONNECT="${GAIT_IMU_PHASE_PRECONNECT:-0}"
+export GAIT_IMU_PHASE_PRECONNECT_REQUIRED="${GAIT_IMU_PHASE_PRECONNECT_REQUIRED:-0}"
+export GAIT_IMU_PHASE_PRECONNECT_TIMEOUT_SEC="${GAIT_IMU_PHASE_PRECONNECT_TIMEOUT_SEC:-60}"
+export GAIT_IMU_PHASE_KEEP_STREAMING="${GAIT_IMU_PHASE_KEEP_STREAMING:-1}"
+export GAIT_IMU_PHASE_SCAN_BEFORE_CONNECT="${GAIT_IMU_PHASE_SCAN_BEFORE_CONNECT:-1}"
+export GAIT_IMU_PHASE_PRECONNECT_LEFT_ONLY="${GAIT_IMU_PHASE_PRECONNECT_LEFT_ONLY:-1}"
 
 wait_for_condition() {
     local timeout_s="${1:-5}"
@@ -111,7 +120,10 @@ is_bluetooth_service_ready() {
 }
 
 bluetooth_power_on_best_effort() {
-    local HCI_DEV="${GAIT_BT_HCI:-hci0}"
+    local HCI_DEVS=("${GAIT_BT_HCI:-hci0}")
+    if [ -n "${GAIT_IMU_BLE_ADAPTER:-}" ] && [ "${GAIT_IMU_BLE_ADAPTER}" != "${HCI_DEVS[0]}" ]; then
+        HCI_DEVS+=("${GAIT_IMU_BLE_ADAPTER}")
+    fi
     local SUDO_CMD=()
     if [ "$(id -u)" -ne 0 ]; then
         if command -v sudo >/dev/null 2>&1; then
@@ -133,7 +145,9 @@ bluetooth_power_on_best_effort() {
         "${SUDO_CMD[@]}" btmgmt discov yes >/dev/null 2>&1 || true
     fi
     if command -v hciconfig >/dev/null 2>&1; then
-        "${SUDO_CMD[@]}" hciconfig "$HCI_DEV" up >/dev/null 2>&1 || true
+        for HCI_DEV in "${HCI_DEVS[@]}"; do
+            "${SUDO_CMD[@]}" hciconfig "$HCI_DEV" up >/dev/null 2>&1 || true
+        done
     fi
 }
 

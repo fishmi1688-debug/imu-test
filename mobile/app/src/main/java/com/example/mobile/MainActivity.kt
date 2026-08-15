@@ -52,11 +52,13 @@ class MainActivity : AppCompatActivity() {
         private const val CONTROL_CHANNEL = "imu_capture_control"
         private const val RESULT_CHANNEL = "imu_capture_result"
 
-        private const val IMU_SLOT_COUNT = 2
+        private const val IMU_SLOT_COUNT = 4
         private const val IMU_SETTINGS_PREFS = "imu_connection_manager"
-        private const val IMU_CONNECT_TIMEOUT_MS = 12000L
+        private const val IMU_CONNECT_TIMEOUT_MS = 60000L
         private const val IMU_SLOT_WALKING = "walking"
         private const val IMU_SLOT_CYCLING = "cycling"
+        private const val IMU_SLOT_PHASE_LEFT = "imu_phase_left"
+        private const val IMU_SLOT_PHASE_RIGHT = "imu_phase_right"
         private const val STATE_FLAG_IMU_WALK_CONNECTED = 16
         private const val STATE_FLAG_IMU_CYCLE_CONNECTED = 20
     }
@@ -538,7 +540,9 @@ class MainActivity : AppCompatActivity() {
         repeat(IMU_SLOT_COUNT) { index ->
             val defaultName = defaultImuName(index)
             val name = imuPrefs.getString("slot.$index.name", defaultName)?.ifBlank { defaultName } ?: defaultName
-            val address = imuPrefs.getString("slot.$index.address", null)?.ifBlank { null }
+            val defaultAddress = defaultImuAddress(index)
+            val address = defaultAddress
+                ?: imuPrefs.getString("slot.$index.address", null)?.ifBlank { null }
             imuSlots.add(
                 ImuSlotState(
                     index = index,
@@ -553,8 +557,18 @@ class MainActivity : AppCompatActivity() {
         return when (index) {
             0 -> getString(R.string.imu_manage_slot_default_1)
             1 -> getString(R.string.imu_manage_slot_default_2)
+            2 -> getString(R.string.imu_manage_slot_default_3)
+            3 -> getString(R.string.imu_manage_slot_default_4)
             else -> "IMU-${index + 1}"
         }
+    }
+
+    private fun defaultImuAddress(index: Int): String? {
+        return null
+    }
+
+    private fun activeImuAddress(index: Int): String? {
+        return defaultImuAddress(index) ?: imuSlots.getOrNull(index)?.address
     }
 
     private fun openImuManageDialog() {
@@ -588,7 +602,17 @@ class MainActivity : AppCompatActivity() {
                 nameInput = view.findViewById(R.id.imuNameInput2),
                 connectSwitch = view.findViewById(R.id.imuConnectSwitch2),
                 addressView = view.findViewById(R.id.imuAddressView2),
-            )
+            ),
+            ImuSlotViews(
+                nameInput = view.findViewById(R.id.imuNameInput3),
+                connectSwitch = view.findViewById(R.id.imuConnectSwitch3),
+                addressView = view.findViewById(R.id.imuAddressView3),
+            ),
+            ImuSlotViews(
+                nameInput = view.findViewById(R.id.imuNameInput4),
+                connectSwitch = view.findViewById(R.id.imuConnectSwitch4),
+                addressView = view.findViewById(R.id.imuAddressView4),
+            ),
         )
 
         imuManageViews = slotViews
@@ -604,7 +628,11 @@ class MainActivity : AppCompatActivity() {
             }
             slotView.addressView.setOnClickListener {
                 persistImuSlotName(index, slotView.nameInput.text.toString())
-                promptImuAddressDialog(index)
+                if (isPhaseImuSlot(index)) {
+                    showStatus("相位 IMU 已改为 gait 端有线 CAN 源，请在 PC 端配置 CAN 接口和帧 ID")
+                } else {
+                    promptImuAddressDialog(index)
+                }
             }
             slotView.connectSwitch.setOnCheckedChangeListener { _, isChecked ->
                 persistImuSlotName(index, slotView.nameInput.text.toString())
@@ -663,6 +691,8 @@ class MainActivity : AppCompatActivity() {
         return when (index) {
             0 -> IMU_SLOT_WALKING
             1 -> IMU_SLOT_CYCLING
+            2 -> IMU_SLOT_PHASE_LEFT
+            3 -> IMU_SLOT_PHASE_RIGHT
             else -> IMU_SLOT_WALKING
         }
     }
@@ -671,8 +701,14 @@ class MainActivity : AppCompatActivity() {
         return when (slot?.trim()?.lowercase()) {
             IMU_SLOT_WALKING -> 0
             IMU_SLOT_CYCLING -> 1
+            IMU_SLOT_PHASE_LEFT -> 2
+            IMU_SLOT_PHASE_RIGHT -> 3
             else -> null
         }
+    }
+
+    private fun isPhaseImuSlot(index: Int): Boolean {
+        return index == 2 || index == 3
     }
 
     private fun onImuToggleRequested(index: Int, requestedConnected: Boolean) {
@@ -690,7 +726,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun requestImuConnect(index: Int) {
         val slot = imuSlots.getOrNull(index) ?: return
-        val address = slot.address
+        val address = activeImuAddress(index)
         slot.connecting = true
         slot.connected = false
         imuLastErrorNotice.remove(index)
@@ -705,7 +741,9 @@ class MainActivity : AppCompatActivity() {
             return
         }
         scheduleImuConnectTimeout(index)
-        if (address.isNullOrBlank()) {
+        if (isPhaseImuSlot(index)) {
+            showStatus("已请求 gait 打开有线 CAN 相位 IMU: ${slot.name}")
+        } else if (address.isNullOrBlank()) {
             showStatus("已请求 gait 连接 IMU: ${slot.name}（使用 gait 默认 MAC）")
         } else {
             showStatus("已请求 gait 连接 IMU: ${slot.name}")
@@ -731,7 +769,7 @@ class MainActivity : AppCompatActivity() {
         payload["t"] = GaitProtocol.TYPE_IMU_MANAGE
         payload["s"] = slotCode
         payload["x"] = connect
-        val macBytes = parseMacBytes(slot.address)
+        val macBytes = parseMacBytes(activeImuAddress(index))
         if (macBytes != null) {
             payload["ma"] = macBytes
         }
@@ -765,17 +803,26 @@ class MainActivity : AppCompatActivity() {
             state.battery = null
             refreshImuManageDialogViews()
             val reasonCode = obj.intOrNull("r") ?: -1
-            showStatus("gait IMU控制失败(${state.name}): ${GaitProtocol.formatReasonCode(reasonCode)}")
+            val detail = obj.stringOrNull("e")?.takeIf { it.isNotBlank() }
+            val detailText = if (detail != null) "，$detail" else ""
+            showStatus("gait IMU控制失败(${state.name}): ${GaitProtocol.formatReasonCode(reasonCode)}$detailText")
             return
         }
         val connected = obj.boolOrNull("k") ?: obj.boolOrNull("connected")
         val measuring = obj.boolOrNull("q") ?: obj.boolOrNull("measuring")
+        val lastError = obj.stringOrNull("e")?.takeIf { it.isNotBlank() }
+        val mac = obj.stringOrNull("mac")
         if (connected != null) {
-            applyRemoteImuStatus(slot, connected, null)
+            applyRemoteImuStatus(slot, connected, mac, lastError)
             val state = imuSlots.getOrNull(slot)
             if (state != null) {
+                val stateText = if (lastError == "connecting" && !connected) {
+                    "connecting"
+                } else {
+                    "connected=$connected"
+                }
                 val measureText = if (measuring == true) ", measuring=true" else ""
-                showStatus("gait IMU应答: ${state.name} connected=$connected$measureText")
+                showStatus("gait IMU应答: ${state.name} $stateText$measureText")
             }
         } else {
             refreshImuManageDialogViews()
@@ -786,13 +833,31 @@ class MainActivity : AppCompatActivity() {
         val compactFlags = obj.intOrNull("f")
         val walkConnected = obj.boolOrNull("imu_walk_connected")
             ?: compactFlags?.hasStateFlag(STATE_FLAG_IMU_WALK_CONNECTED)
-        if (walkConnected != null) {
-            applyRemoteImuStatus(0, walkConnected, null)
+        val walkError = obj.stringOrNull("imu_walk_last_error")
+            ?: obj.stringOrNull("iwe")
+        if (walkConnected != null || walkError != null) {
+            applyRemoteImuStatus(0, walkConnected ?: false, null, walkError)
         }
         val cycleConnected = obj.boolOrNull("imu_cycle_connected")
             ?: compactFlags?.hasStateFlag(STATE_FLAG_IMU_CYCLE_CONNECTED)
-        if (cycleConnected != null) {
-            applyRemoteImuStatus(1, cycleConnected, null)
+        val cycleError = obj.stringOrNull("imu_cycle_last_error")
+            ?: obj.stringOrNull("ice")
+        if (cycleConnected != null || cycleError != null) {
+            applyRemoteImuStatus(1, cycleConnected ?: false, null, cycleError)
+        }
+        val phaseLeftConnected = obj.boolOrNull("imu_phase_left_connected")
+            ?: obj.boolOrNull("iplc")
+        val phaseLeftError = obj.stringOrNull("imu_phase_left_last_error")
+            ?: obj.stringOrNull("iple")
+        if (phaseLeftConnected != null || phaseLeftError != null) {
+            applyRemoteImuStatus(2, phaseLeftConnected ?: false, null, phaseLeftError)
+        }
+        val phaseRightConnected = obj.boolOrNull("imu_phase_right_connected")
+            ?: obj.boolOrNull("iprc")
+        val phaseRightError = obj.stringOrNull("imu_phase_right_last_error")
+            ?: obj.stringOrNull("ipre")
+        if (phaseRightConnected != null || phaseRightError != null) {
+            applyRemoteImuStatus(3, phaseRightConnected ?: false, null, phaseRightError)
         }
     }
 
@@ -803,7 +868,7 @@ class MainActivity : AppCompatActivity() {
             slot.connected = true
             slot.connecting = false
             imuLastErrorNotice.remove(index)
-            if (!mac.isNullOrBlank()) {
+            if (!isPhaseImuSlot(index) && !mac.isNullOrBlank()) {
                 val current = normalizeMac(slot.address)
                 val incoming = normalizeMac(mac)
                 if (incoming != null && current != incoming) {
@@ -814,13 +879,20 @@ class MainActivity : AppCompatActivity() {
         } else {
             slot.connected = false
             val normalizedError = lastError?.trim().orEmpty()
-            if (slot.connecting && normalizedError.isNotBlank()) {
+            if (
+                slot.connecting &&
+                normalizedError.isNotBlank() &&
+                normalizedError != "connecting"
+            ) {
                 cancelImuConnectTimeout(index)
                 slot.connecting = false
                 val prev = imuLastErrorNotice[index]
                 if (prev != normalizedError) {
                     imuLastErrorNotice[index] = normalizedError
                     showStatus("gait侧${slot.name}连接失败: $normalizedError")
+                }
+                if (!isPhaseImuSlot(index)) {
+                    sendImuManageCommand(index = index, connect = false)
                 }
             }
             if (!slot.connecting) {
@@ -846,6 +918,9 @@ class MainActivity : AppCompatActivity() {
             slot.connected = false
             slot.battery = null
             refreshImuManageDialogViews()
+            if (!isPhaseImuSlot(index)) {
+                sendImuManageCommand(index = index, connect = false)
+            }
             showStatus("IMU 连接超时: ${slot.name}，请检查 gait 端日志和 IMU 电源")
         }
         imuConnectTimeoutTasks[index] = task
@@ -855,7 +930,7 @@ class MainActivity : AppCompatActivity() {
     private fun promptImuAddressDialog(slotIndex: Int) {
         val slot = imuSlots.getOrNull(slotIndex) ?: return
         val input = EditText(this).apply {
-            setText(slot.address.orEmpty())
+            setText(activeImuAddress(slotIndex).orEmpty())
             setSelection(text.length)
             hint = "AA:BB:CC:DD:EE:FF"
             inputType = android.text.InputType.TYPE_CLASS_TEXT
@@ -936,7 +1011,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun buildImuAddressLine(slot: ImuSlotState): String {
-        val target = slot.address
+        if (isPhaseImuSlot(slot.index)) {
+            return if (slot.connected) {
+                getString(R.string.imu_manage_wired_can_line_connected)
+            } else {
+                getString(R.string.imu_manage_wired_can_line)
+            }
+        }
+        val target = activeImuAddress(slot.index)
         if (target.isNullOrBlank()) {
             return getString(R.string.imu_manage_unbound)
         }

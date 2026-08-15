@@ -22,10 +22,17 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
         private const val STATE_FRESH_THRESHOLD_MS = 1500L
         private const val STARTUP_WAIT_PLOT_MS = 4000L
         private const val PLOT_WINDOW_SECONDS = 10
+        private val IMU_PHASE_MODE_KEYS = setOf("imu_phase", "imu_left_phase")
     }
 
     private lateinit var statusView: TextView
     private lateinit var roadConditionView: TextView
+    private lateinit var plotTitleView: TextView
+    private lateinit var plotSubtitleView: TextView
+    private lateinit var jointLabelView: TextView
+    private lateinit var angleLabelView: TextView
+    private lateinit var phaseLabelView: TextView
+    private lateinit var assistLabelView: TextView
     private lateinit var jointChart: LineChart
     private lateinit var angleChart: LineChart
     private lateinit var phaseChart: LineChart
@@ -34,8 +41,11 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
     private lateinit var leftJointDataSet: LineDataSet
     private lateinit var rightJointDataSet: LineDataSet
     private lateinit var angleDataSet: LineDataSet
+    private lateinit var leftVelocityDataSet: LineDataSet
+    private lateinit var rightVelocityDataSet: LineDataSet
     private lateinit var phaseDataSet: LineDataSet
     private lateinit var assistDataSet: LineDataSet
+    private lateinit var rightAssistDataSet: LineDataSet
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var sampleIndex = 0f
@@ -50,6 +60,7 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
     private var latestStateSnapshot: GaitBluetoothBridge.StateSnapshot? = null
     private var lastStatusText: String? = null
     private var lastRoadConditionText: String? = null
+    private var currentPlotPresentationIsImuPhase: Boolean? = null
 
     private val redrawRunnable = object : Runnable {
         override fun run() {
@@ -67,6 +78,7 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
         latestStateSnapshot = snapshot
         lastStateUpdateElapsedMs = SystemClock.elapsedRealtime()
         runOnUiThread {
+            updatePlotModePresentation()
             updateStatusText()
         }
     }
@@ -96,6 +108,12 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
 
         statusView = findViewById(R.id.plotStatusView)
         roadConditionView = findViewById(R.id.roadConditionView)
+        plotTitleView = findViewById(R.id.plotTitleView)
+        plotSubtitleView = findViewById(R.id.plotSubtitleView)
+        jointLabelView = findViewById(R.id.jointLabelView)
+        angleLabelView = findViewById(R.id.angleLabelView)
+        phaseLabelView = findViewById(R.id.phaseLabelView)
+        assistLabelView = findViewById(R.id.assistLabelView)
         jointChart = findViewById(R.id.jointChart)
         angleChart = findViewById(R.id.angleChart)
         phaseChart = findViewById(R.id.phaseChart)
@@ -104,13 +122,17 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
         leftJointDataSet = createDataSet("LeftAngle", colorOf(R.color.chart_series_primary))
         rightJointDataSet = createDataSet("RightAngle", colorOf(R.color.chart_series_secondary))
         angleDataSet = createDataSet("AngleDiff", colorOf(R.color.chart_series_tertiary))
+        leftVelocityDataSet = createDataSet("LeftVelocity", colorOf(R.color.chart_series_primary))
+        rightVelocityDataSet = createDataSet("RightVelocity", colorOf(R.color.chart_series_secondary))
         phaseDataSet = createDataSet("Phase", colorOf(R.color.chart_series_quaternary))
         assistDataSet = createDataSet("Assist", colorOf(R.color.chart_series_quinary))
+        rightAssistDataSet = createDataSet("RightAssist", colorOf(R.color.chart_series_senary))
 
         setupChart(jointChart, leftJointDataSet, rightJointDataSet)
-        setupChart(angleChart, angleDataSet)
+        setupChart(angleChart, angleDataSet, leftVelocityDataSet, rightVelocityDataSet)
         setupChart(phaseChart, phaseDataSet)
-        setupChart(assistChart, assistDataSet)
+        setupChart(assistChart, assistDataSet, rightAssistDataSet)
+        updatePlotModePresentation()
     }
 
     override fun onStart() {
@@ -191,14 +213,19 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
         lastRenderedPlotReceivedElapsedMs = frame.receivedElapsedMs
         lastPlotUpdateElapsedMs = frame.receivedElapsedMs
         latestRenderedFrame = frame
+        val isImuPhaseMode = isImuPhasePresentation(frame, latestStateSnapshot)
+        updatePlotModePresentation(isImuPhaseMode)
         val x = sampleIndex
         sampleIndex += 1f
 
         addEntry(leftJointDataSet, x, frame.leftAngle)
         addEntry(rightJointDataSet, x, frame.rightAngle)
-        addEntry(angleDataSet, x, frame.angleDiff)
+        addEntry(angleDataSet, x, if (isImuPhaseMode) 0f else frame.angleDiff)
+        addEntry(leftVelocityDataSet, x, if (isImuPhaseMode) frame.leftAngularVelocity ?: 0f else 0f)
+        addEntry(rightVelocityDataSet, x, if (isImuPhaseMode) frame.rightAngularVelocity ?: 0f else 0f)
         addEntry(phaseDataSet, x, frame.phase)
         addEntry(assistDataSet, x, frame.assist)
+        addEntry(rightAssistDataSet, x, frame.rightAssist ?: 0f)
 
         refreshChart(jointChart)
         refreshChart(angleChart)
@@ -238,7 +265,14 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
         }
 
         val motionMode = state?.motionMode ?: "-"
+        val hasImuVelocityFrame = frame?.let {
+            it.leftAngularVelocity != null && it.rightAngularVelocity != null
+        } == true
+        val isImuPhaseMode = isImuPhasePresentation(frame, state, hasImuVelocityFrame)
         val isTestMode = motionMode == "test" || motionMode == "walking_test"
+        val isManualAssistMode = isTestMode ||
+            motionMode == "stairs_down" ||
+            motionMode in IMU_PHASE_MODE_KEYS
         val testAnyPhaseValid = state?.testLeftPhaseValid == true || state?.testRightPhaseValid == true
         val testAnyAssistReady = state?.testLeftAssistReady == true || state?.testRightAssistReady == true
         val testAwaitFirstPeak = isTestMode &&
@@ -251,7 +285,9 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
 
         val assistTag = when {
             state?.assistOutputActive == true -> "助力输出中"
-            isTestMode && state?.manualAssistEnabled == false -> "待手动开启"
+            isManualAssistMode && state?.manualAssistEnabled == false -> "待手动开启"
+            isImuPhaseMode && state?.assistArmed == true && state.imuPhaseMotionActive == false ->
+                "静止不助力"
             testAwaitFirstPeak -> "等待首个峰值"
             testSampling -> "首周期采样中"
             isTestMode && !testAnyAssistReady -> "等待峰值建立"
@@ -280,20 +316,36 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
         }
         val scoreText = state?.detectionScore?.let { formatValue(it) } ?: "-"
         val phaseText = frame?.phase?.let { formatValue(it.toDouble()) } ?: "-"
-        val assistText = frame?.assist?.let { formatValue(it.toDouble()) } ?: "-"
-        val angleDiffText = frame?.angleDiff?.let { formatValue(it.toDouble()) } ?: "-"
+        val assistText = if (isImuPhaseMode && frame?.rightAssist != null) {
+            "L=${formatValue(frame.assist.toDouble())}/R=${formatValue(frame.rightAssist.toDouble())}"
+        } else {
+            frame?.assist?.let { formatValue(it.toDouble()) } ?: "-"
+        }
+        val angleMetricText = if (isImuPhaseMode) {
+            val lv = frame?.leftAngularVelocity?.let { formatValue(it.toDouble()) } ?: "-"
+            val rv = frame?.rightAngularVelocity?.let { formatValue(it.toDouble()) } ?: "-"
+            "L/R大腿矢状面角速度=$lv/$rv"
+        } else {
+            val diff = frame?.angleDiff?.let { formatValue(it.toDouble()) } ?: "-"
+            "角度差=$diff"
+        }
         val gateFlags = mutableListOf<String>()
         state?.let { snapshot ->
             gateFlags += "系统=${if (snapshot.mechanicalZeroReady) "就绪" else "未就绪"}"
             gateFlags += "运动确认=${if (snapshot.motionConfirmed) "通过" else "未通过"}"
             gateFlags += "助力=${if (snapshot.assistArmed) "开" else "关"}"
             gateFlags += "输出=${if (snapshot.assistOutputActive) "有" else "无"}"
-            if (isTestMode) {
+            if (isManualAssistMode) {
                 gateFlags += "手动=${if (snapshot.manualAssistEnabled) "开" else "关"}"
+            }
+            if (isTestMode) {
                 gateFlags += "test相位=L${if (snapshot.testLeftPhaseValid) 1 else 0}/R${if (snapshot.testRightPhaseValid) 1 else 0}"
                 gateFlags += "峰值=L${if (snapshot.testLeftAssistReady) 1 else 0}/R${if (snapshot.testRightAssistReady) 1 else 0}"
             }
             gateFlags += "相位=${if (snapshot.phaseActive) "有效" else "无效"}"
+            if (isImuPhaseMode) {
+                gateFlags += "IMU运动=${if (snapshot.imuPhaseMotionActive) "运动" else "静止"}"
+            }
             gateFlags += if (snapshot.assistWaitNextZero) "门控=等零点" else "门控=开放"
         }
         val gateText = if (gateFlags.isEmpty()) "门控=未知" else gateFlags.joinToString(" ")
@@ -312,13 +364,107 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
         }
 
         val statusText =
-            "状态: 模式=$motionMode $assistTag 角度差=$angleDiffText 相位=$phaseText 助力=$assistText\n" +
+            "状态: 模式=$motionMode $assistTag $angleMetricText 相位=$phaseText 助力=$assistText\n" +
                 "IMU启停判定: $imuStartStopTag (连接=$imuConnTag, 就绪=$imuReadyTag, 数据=$imuStaleTag, 标签=$imuLabel, 概率=$scoreText)\n" +
                 "助力门控: $gateText\n" +
                 "IMU诊断: $imuErrorText\n" +
                 "绘图诊断: $plotDiagText" +
                 testHint
         setStatusTextIfChanged(statusText)
+    }
+
+    private fun updatePlotModePresentation(isImuPhaseModeOverride: Boolean? = null) {
+        if (!::angleDataSet.isInitialized) {
+            return
+        }
+        val isImuPhaseMode = isImuPhaseModeOverride ?: isImuPhasePresentation(
+            latestRenderedFrame,
+            latestStateSnapshot,
+        )
+        val presentationChanged =
+            currentPlotPresentationIsImuPhase != null &&
+                currentPlotPresentationIsImuPhase != isImuPhaseMode
+        currentPlotPresentationIsImuPhase = isImuPhaseMode
+        if (presentationChanged) {
+            clearPlotData()
+        }
+        if (isImuPhaseMode) {
+            val mode = latestStateSnapshot?.motionMode
+            val isLeftOnlyMode = mode == "imu_left_phase"
+            plotTitleView.text = if (isLeftOnlyMode) {
+                "左IMU相位实时数据"
+            } else {
+                "IMU相位实时数据"
+            }
+            plotSubtitleView.text = if (isLeftOnlyMode) {
+                "左大腿矢状面角度/角速度、左相位推导右相位、左右助力实时曲线"
+            } else {
+                "左右大腿矢状面角度/角速度/相位/左右助力实时曲线"
+            }
+            jointLabelView.text = "左右大腿矢状面角度 (deg)"
+            angleLabelView.text = "左右大腿矢状面角速度 (deg/s)"
+            phaseLabelView.text = "IMU相位 (rad)"
+            assistLabelView.text = "左右助力 (Nm)"
+            leftJointDataSet.label = "LeftThighSagittalAngle"
+            rightJointDataSet.label = if (isLeftOnlyMode) {
+                "RightThighSagittalAngleDerived"
+            } else {
+                "RightThighSagittalAngle"
+            }
+            assistDataSet.label = "LeftAssist"
+            angleDataSet.setVisible(false)
+            leftVelocityDataSet.setVisible(true)
+            rightVelocityDataSet.setVisible(true)
+            rightAssistDataSet.setVisible(true)
+        } else {
+            plotTitleView.text = getString(R.string.ui_text_076)
+            plotSubtitleView.text = "左右关节角度/角度差/相位/助力实时曲线"
+            jointLabelView.text = getString(R.string.ui_text_081)
+            angleLabelView.text = getString(R.string.ui_text_077)
+            phaseLabelView.text = getString(R.string.ui_text_078)
+            assistLabelView.text = getString(R.string.ui_text_079)
+            leftJointDataSet.label = "LeftAngle"
+            rightJointDataSet.label = "RightAngle"
+            assistDataSet.label = "Assist"
+            angleDataSet.setVisible(true)
+            leftVelocityDataSet.setVisible(false)
+            rightVelocityDataSet.setVisible(false)
+            rightAssistDataSet.setVisible(false)
+        }
+    }
+
+    private fun clearPlotData() {
+        listOf(
+            leftJointDataSet,
+            rightJointDataSet,
+            angleDataSet,
+            leftVelocityDataSet,
+            rightVelocityDataSet,
+            phaseDataSet,
+            assistDataSet,
+            rightAssistDataSet,
+        ).forEach { it.clear() }
+        sampleIndex = 0f
+        listOf(jointChart, angleChart, phaseChart, assistChart).forEach { chart ->
+            chart.data?.notifyDataChanged()
+            chart.notifyDataSetChanged()
+            chart.invalidate()
+        }
+    }
+
+    private fun isImuPhasePresentation(
+        frame: GaitBluetoothBridge.PlotFrame?,
+        state: GaitBluetoothBridge.StateSnapshot?,
+        hasImuVelocityFrame: Boolean = frame?.let {
+            it.leftAngularVelocity != null && it.rightAngularVelocity != null
+        } == true,
+    ): Boolean {
+        val mode = state?.motionMode?.takeIf { it.isNotBlank() && it != "-" }
+        return if (mode != null) {
+            mode in IMU_PHASE_MODE_KEYS
+        } else {
+            hasImuVelocityFrame
+        }
     }
 
     private fun buildPlotDiagnosis(nowElapsedMs: Long): String {

@@ -17,6 +17,7 @@ object GaitBluetoothBridge {
     private const val PLOT_FORMAT_COMPACT_V1 = "c1"
     private const val PLOT_BINARY_HEADER_SIZE = 8
     private const val PLOT_BINARY_RECORD_SIZE = 18
+    private const val PLOT_BINARY_EXT_RECORD_SIZE = 24
     private const val PLOT_BINARY_KIND_SINGLE = 1
     private const val PLOT_BINARY_KIND_BATCH = 2
     private val PLOT_BINARY_MAGIC = byteArrayOf(0x47, 0x42, 0x46, 0x31) // "GBF1"
@@ -37,6 +38,7 @@ object GaitBluetoothBridge {
     private const val FLAG_IMU_CONNECTED = 13
     private const val FLAG_IMU_READY = 14
     private const val FLAG_IMU_STALE = 15
+    private const val FLAG_IMU_PHASE_MOTION_ACTIVE = 24
 
     private val COMPACT_MODE_KEYS = listOf(
         "walking",
@@ -47,6 +49,8 @@ object GaitBluetoothBridge {
         "cycling",
         "uphill",
         "downhill",
+        "imu_phase",
+        "imu_left_phase",
     )
 
     data class PlotFrame(
@@ -56,6 +60,9 @@ object GaitBluetoothBridge {
         val angleDiff: Float,
         val phase: Float,
         val assist: Float,
+        val leftAngularVelocity: Float? = null,
+        val rightAngularVelocity: Float? = null,
+        val rightAssist: Float? = null,
         val receivedElapsedMs: Long = SystemClock.elapsedRealtime(),
     )
 
@@ -64,6 +71,7 @@ object GaitBluetoothBridge {
         val motionMode: String,
         val gaitState: Int,
         val phaseActive: Boolean,
+        val imuPhaseMotionActive: Boolean,
         val assistWaitNextZero: Boolean,
         val manualAssistEnabled: Boolean,
         val assistEnabled: Boolean,
@@ -343,6 +351,9 @@ object GaitBluetoothBridge {
         val angleDiff = if (compact) doubleOrNull("d") else doubleOrNull("angle_diff") ?: doubleOrNull("d")
         val phase = if (compact) doubleOrNull("p") else doubleOrNull("phase") ?: doubleOrNull("p")
         val assist = if (compact) doubleOrNull("a") else doubleOrNull("assist") ?: doubleOrNull("a")
+        val leftAngularVelocity = doubleOrNull("lv") ?: doubleOrNull("left_velocity")
+        val rightAngularVelocity = doubleOrNull("rv") ?: doubleOrNull("right_velocity")
+        val rightAssist = doubleOrNull("ra") ?: doubleOrNull("assist_right")
         if (ts == null || leftAngle == null || rightAngle == null || angleDiff == null || phase == null || assist == null) {
             return null
         }
@@ -353,6 +364,9 @@ object GaitBluetoothBridge {
             angleDiff = angleDiff.toFloat(),
             phase = phase.toFloat(),
             assist = assist.toFloat(),
+            leftAngularVelocity = leftAngularVelocity?.toFloat(),
+            rightAngularVelocity = rightAngularVelocity?.toFloat(),
+            rightAssist = rightAssist?.toFloat(),
         )
     }
 
@@ -373,6 +387,9 @@ object GaitBluetoothBridge {
                     val diff = row[3].asDouble
                     val phase = row[4].asDouble
                     val assist = row[5].asDouble
+                    val leftVelocity = if (row.size() >= 8) row[6].asDouble else null
+                    val rightVelocity = if (row.size() >= 8) row[7].asDouble else null
+                    val rightAssist = if (row.size() >= 9) row[8].asDouble else null
                     PlotFrame(
                         ts = ts,
                         leftAngle = left.toFloat(),
@@ -380,6 +397,9 @@ object GaitBluetoothBridge {
                         angleDiff = diff.toFloat(),
                         phase = phase.toFloat(),
                         assist = assist.toFloat(),
+                        leftAngularVelocity = leftVelocity?.toFloat(),
+                        rightAngularVelocity = rightVelocity?.toFloat(),
+                        rightAssist = rightAssist?.toFloat(),
                     )
                 }.getOrNull()
             }
@@ -406,7 +426,12 @@ object GaitBluetoothBridge {
         if (kind != PLOT_BINARY_KIND_SINGLE && kind != PLOT_BINARY_KIND_BATCH) {
             return emptyList()
         }
-        if (count <= 0 || payloadLength != count * PLOT_BINARY_RECORD_SIZE) {
+        val recordSize = when (payloadLength) {
+            count * PLOT_BINARY_RECORD_SIZE -> PLOT_BINARY_RECORD_SIZE
+            count * PLOT_BINARY_EXT_RECORD_SIZE -> PLOT_BINARY_EXT_RECORD_SIZE
+            else -> return emptyList()
+        }
+        if (count <= 0) {
             return emptyList()
         }
         val payload = ByteBuffer.wrap(frame, PLOT_BINARY_HEADER_SIZE, payloadLength)
@@ -419,6 +444,18 @@ object GaitBluetoothBridge {
             val diff = payload.getShort().toInt() / 100.0
             val phase = payload.getShort().toInt() / 1000.0
             val assist = payload.getShort().toInt() / 100.0
+            val leftVelocity: Double?
+            val rightVelocity: Double?
+            val rightAssist: Double?
+            if (recordSize == PLOT_BINARY_EXT_RECORD_SIZE) {
+                leftVelocity = payload.getShort().toInt() / 100.0
+                rightVelocity = payload.getShort().toInt() / 100.0
+                rightAssist = payload.getShort().toInt() / 100.0
+            } else {
+                leftVelocity = null
+                rightVelocity = null
+                rightAssist = null
+            }
             result.add(
                 PlotFrame(
                     ts = tsMs / 1000.0,
@@ -427,6 +464,9 @@ object GaitBluetoothBridge {
                     angleDiff = diff.toFloat(),
                     phase = phase.toFloat(),
                     assist = assist.toFloat(),
+                    leftAngularVelocity = leftVelocity?.toFloat(),
+                    rightAngularVelocity = rightVelocity?.toFloat(),
+                    rightAssist = rightAssist?.toFloat(),
                 )
             )
         }
@@ -467,6 +507,78 @@ object GaitBluetoothBridge {
         val assistEnabled = booleanOrNull("assist_enabled")
             ?: compactFlags?.hasStateFlag(FLAG_ASSIST_ENABLED)
             ?: assistArmed
+        val phaseLeftConnected = booleanOrNull("imu_phase_left_connected")
+            ?: booleanOrNull("iplc")
+        val phaseRightConnected = booleanOrNull("imu_phase_right_connected")
+            ?: booleanOrNull("iprc")
+        val phaseLeftReady = booleanOrNull("imu_phase_left_ready")
+            ?: booleanOrNull("ipld")
+        val phaseRightReady = booleanOrNull("imu_phase_right_ready")
+            ?: booleanOrNull("iprd")
+        val phaseLeftStale = booleanOrNull("imu_phase_left_stale")
+            ?: booleanOrNull("iplz")
+        val phaseRightStale = booleanOrNull("imu_phase_right_stale")
+            ?: booleanOrNull("iprz")
+        val phaseLeftError = stringOrNull("imu_phase_left_last_error")
+            ?: stringOrNull("iple")
+        val phaseRightError = stringOrNull("imu_phase_right_last_error")
+            ?: stringOrNull("ipre")
+        val isImuPhaseMode = motionMode == "imu_phase" || motionMode == "imu_left_phase"
+        val isLeftOnlyImuPhaseMode = motionMode == "imu_left_phase"
+        val imuConnectedForMode = if (isImuPhaseMode) {
+            when {
+                phaseLeftConnected != null || phaseRightConnected != null ->
+                    phaseLeftConnected == true &&
+                        (isLeftOnlyImuPhaseMode || phaseRightConnected == true)
+                else -> compactFlags?.hasStateFlag(FLAG_IMU_CONNECTED)
+            }
+        } else {
+            booleanOrNull("imu_connected")
+                ?: compactFlags?.hasStateFlag(FLAG_IMU_CONNECTED)
+        }
+        val imuReadyForMode = if (isImuPhaseMode) {
+            when {
+                phaseLeftReady != null || phaseRightReady != null ->
+                    phaseLeftReady == true &&
+                        (isLeftOnlyImuPhaseMode || phaseRightReady == true)
+                else -> compactFlags?.hasStateFlag(FLAG_IMU_READY)
+            }
+        } else {
+            booleanOrNull("imu_ready")
+                ?: compactFlags?.hasStateFlag(FLAG_IMU_READY)
+        }
+        val imuStaleForMode = if (isImuPhaseMode) {
+            when {
+                phaseLeftStale != null || phaseRightStale != null ->
+                    phaseLeftStale == true ||
+                        (!isLeftOnlyImuPhaseMode && phaseRightStale == true)
+                else -> compactFlags?.hasStateFlag(FLAG_IMU_STALE)
+            }
+        } else {
+            booleanOrNull("imu_stale")
+                ?: compactFlags?.hasStateFlag(FLAG_IMU_STALE)
+        }
+        val imuErrorForMode = if (isImuPhaseMode) {
+            if (isLeftOnlyImuPhaseMode) {
+                phaseLeftError?.takeIf { it.isNotBlank() }?.let { "L:$it" }
+            } else {
+                listOfNotNull(
+                    phaseLeftError?.takeIf { it.isNotBlank() }?.let { "L:$it" },
+                    phaseRightError?.takeIf { it.isNotBlank() }?.let { "R:$it" },
+                ).joinToString(" ").ifBlank { null }
+            }
+        } else {
+            stringOrNull("imu_last_error")
+        }
+        val imuLabelForMode = if (isImuPhaseMode) {
+            if (isLeftOnlyImuPhaseMode) {
+                "L${if (phaseLeftConnected == true) 1 else 0}/R=+pi"
+            } else {
+                "L${if (phaseLeftConnected == true) 1 else 0}/R${if (phaseRightConnected == true) 1 else 0}"
+            }
+        } else {
+            stringOrNull("imu_label")
+        }
 
         return StateSnapshot(
             ts = doubleOrNull("ts") ?: 0.0,
@@ -474,6 +586,10 @@ object GaitBluetoothBridge {
             gaitState = intOrNull("gait_state") ?: intOrNull("gs") ?: 0,
             phaseActive = booleanOrNull("phase_active")
                 ?: compactFlags?.hasStateFlag(FLAG_PHASE_ACTIVE)
+                ?: false,
+            imuPhaseMotionActive = booleanOrNull("imu_phase_motion_active")
+                ?: booleanOrNull("ipm")
+                ?: compactFlags?.hasStateFlag(FLAG_IMU_PHASE_MOTION_ACTIVE)
                 ?: false,
             assistWaitNextZero = booleanOrNull("assist_wait_next_zero")
                 ?: compactFlags?.hasStateFlag(FLAG_ASSIST_WAIT_NEXT_ZERO)
@@ -505,14 +621,11 @@ object GaitBluetoothBridge {
                 ?: compactFlags?.hasStateFlag(FLAG_TEST_RIGHT_ASSIST_READY)
                 ?: false,
             detectionScore = doubleOrNull("detection_score") ?: doubleOrNull("ds") ?: 0.0,
-            imuConnected = booleanOrNull("imu_connected")
-                ?: compactFlags?.hasStateFlag(FLAG_IMU_CONNECTED),
-            imuReady = booleanOrNull("imu_ready")
-                ?: compactFlags?.hasStateFlag(FLAG_IMU_READY),
-            imuStale = booleanOrNull("imu_stale")
-                ?: compactFlags?.hasStateFlag(FLAG_IMU_STALE),
-            imuLastError = stringOrNull("imu_last_error"),
-            imuLabel = stringOrNull("imu_label"),
+            imuConnected = imuConnectedForMode,
+            imuReady = imuReadyForMode,
+            imuStale = imuStaleForMode,
+            imuLastError = imuErrorForMode,
+            imuLabel = imuLabelForMode,
         )
     }
 

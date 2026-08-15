@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import threading
 import time
@@ -81,6 +82,17 @@ def _normalize_mac(mac_address: str) -> str:
     return str(mac_address or "").strip().upper()
 
 
+def _format_exception(exc: BaseException) -> str:
+    text = str(exc).strip()
+    exc_type = exc.__class__.__name__
+    if text:
+        return f"{exc_type}: {text}"
+    detail = repr(exc).strip()
+    if detail and detail != f"{exc_type}()":
+        return f"{exc_type}: {detail}"
+    return exc_type
+
+
 def _iter_scanner_devices(scan_result: Any) -> list[Any]:
     if scan_result is None:
         return []
@@ -94,6 +106,24 @@ def _iter_scanner_devices(scan_result: Any) -> list[Any]:
             item = item[0]
         devices.append(item)
     return devices
+
+
+def _bleak_adapter_kwargs(callable_obj: Any, adapter: str) -> dict[str, Any]:
+    adapter = str(adapter or "").strip()
+    if not adapter:
+        return {}
+    try:
+        parameters = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return {"bluez": {"adapter": adapter}}
+
+    if "adapter" in parameters:
+        return {"adapter": adapter}
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return {"adapter": adapter}
+    if "bluez" in parameters:
+        return {"bluez": {"adapter": adapter}}
+    return {}
 
 
 def _zero_crossing_rate(x: np.ndarray) -> float:
@@ -151,6 +181,11 @@ class IMUModelStartStopDetector:
         connect_timeout_sec: float = 10.0,
         reconnect_interval_sec: float = 2.0,
         walk_prob_threshold: float = DEFAULT_WALK_PROB_THRESHOLD,
+        require_model: bool = True,
+        payload_mode: Any = None,
+        filter_profile: Any = None,
+        scan_before_connect: Optional[bool] = None,
+        ble_adapter: Optional[str] = None,
     ):
         self.model_path = Path(model_path) if model_path else DEFAULT_MODEL_PATH
         self.mac_address = mac_address.strip() or DEFAULT_IMU_MAC
@@ -161,7 +196,41 @@ class IMUModelStartStopDetector:
         self.data_timeout_sec = float(data_timeout_sec)
         self.connect_timeout_sec = float(connect_timeout_sec)
         self.reconnect_interval_sec = float(reconnect_interval_sec)
-        self.scan_before_connect = _env_enabled("GAIT_IMU_SCAN_BEFORE_CONNECT", True)
+        self.require_model = bool(require_model)
+        self.ble_adapter = str(
+            ble_adapter
+            if ble_adapter is not None
+            else os.environ.get("GAIT_IMU_BLE_ADAPTER", "")
+        ).strip()
+        if PayloadMode is not None:
+            default_payload_mode = (
+                PayloadMode.RATE_QUANTITIES
+                if self.require_model
+                else PayloadMode.CUSTOM_MODE_5
+            )
+            self.payload_mode = payload_mode if payload_mode is not None else default_payload_mode
+        else:
+            self.payload_mode = payload_mode
+        if FilterProfile is not None:
+            default_filter_profile = (
+                FilterProfile.DYNAMIC
+                if self.require_model
+                else FilterProfile.GENERAL
+            )
+            self.filter_profile = (
+                filter_profile
+                if filter_profile is not None
+                else default_filter_profile
+            )
+        else:
+            self.filter_profile = filter_profile
+        if scan_before_connect is None:
+            self.scan_before_connect = _env_enabled(
+                "GAIT_IMU_SCAN_BEFORE_CONNECT",
+                self.require_model,
+            )
+        else:
+            self.scan_before_connect = bool(scan_before_connect)
         self.scan_timeout_sec = _read_env_float(
             "GAIT_IMU_SCAN_TIMEOUT_SEC",
             max(12.0, self.connect_timeout_sec),
@@ -181,6 +250,7 @@ class IMUModelStartStopDetector:
         self._connected = False
         self._measuring = False
         self._measurement_enabled = False
+        self._measurement_restart_requested = False
         self._last_error = ""
 
         self._model = None
@@ -197,6 +267,8 @@ class IMUModelStartStopDetector:
         self._sample_seq = 0
         self._last_infer_seq = 0
         self._last_sample_time = 0.0
+        self._latest_sample_6d: Optional[np.ndarray] = None
+        self._latest_sample_seq = 0
 
         self._stable_state = 0
         self._motion_votes = 0
@@ -211,8 +283,8 @@ class IMUModelStartStopDetector:
         }
 
         self._parser = None
-        if PayloadParser is not None and PayloadMode is not None:
-            self._parser = PayloadParser(PayloadMode.RATE_QUANTITIES)
+        if PayloadParser is not None and self.payload_mode is not None:
+            self._parser = PayloadParser(self.payload_mode)
 
     @property
     def last_error(self) -> str:
@@ -224,6 +296,9 @@ class IMUModelStartStopDetector:
             self._last_error = message
 
     def _load_model(self) -> bool:
+        if not self.require_model:
+            self._set_error("")
+            return True
         if _JOBLIB_IMPORT_ERROR is not None or joblib is None:
             self._set_error(f"joblib 不可用: {_JOBLIB_IMPORT_ERROR}")
             return False
@@ -262,10 +337,15 @@ class IMUModelStartStopDetector:
 
         self._stop_event.clear()
         self._running = True
+        thread_name = (
+            "imu-model-start-stop"
+            if self.require_model
+            else "imu-sample-reader"
+        )
         self._thread = threading.Thread(
             target=self._thread_main,
             daemon=True,
-            name="imu-model-start-stop",
+            name=thread_name,
         )
         self._thread.start()
         return True
@@ -288,9 +368,19 @@ class IMUModelStartStopDetector:
             self._measurement_enabled = bool(enabled)
             if not enabled:
                 self._measuring = False
+                self._measurement_restart_requested = False
                 self._stable_state = 0
                 self._motion_votes = 0
                 self._stop_votes = 0
+
+    def request_measurement_restart(self) -> bool:
+        """Ask the BLE worker to restart IMU notifications without dropping the connection."""
+        with self._lock:
+            if not self._running:
+                return False
+            self._measurement_enabled = True
+            self._measurement_restart_requested = True
+            return True
 
     def detect(self) -> tuple[int, bool, dict[str, Any]]:
         now = time.time()
@@ -308,6 +398,7 @@ class IMUModelStartStopDetector:
             info["measuring"] = bool(self._measuring)
             info["mac_address"] = self.mac_address
             info["last_error"] = self._last_error
+            info["ble_adapter"] = self.ble_adapter
             info["stale"] = stale
             info["sample_rate_hz"] = self.sample_rate_hz
             info["window_size"] = self._window_size
@@ -316,6 +407,17 @@ class IMUModelStartStopDetector:
             info["stop_votes"] = self._stop_votes
             info["walk_prob_threshold"] = self.walk_prob_threshold
         return gait_state, state_changed, info
+
+    def get_latest_sample_6d(self) -> Optional[tuple[np.ndarray, float, int]]:
+        """Return the latest raw [acc, gyro] sample, sample time, and sequence."""
+        with self._lock:
+            if self._latest_sample_6d is None:
+                return None
+            return (
+                np.asarray(self._latest_sample_6d, dtype=float).copy(),
+                float(self._last_sample_time),
+                int(self._latest_sample_seq),
+            )
 
     def _thread_main(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -339,7 +441,8 @@ class IMUModelStartStopDetector:
             sensor = None
             measuring_now = False
             try:
-                self._set_error(f"等待IMU蓝牙连接通道: {self.mac_address}")
+                adapter_note = f", adapter={self.ble_adapter}" if self.ble_adapter else ""
+                self._set_error(f"等待IMU蓝牙连接通道: {self.mac_address}{adapter_note}")
                 lock_acquired = await asyncio.to_thread(
                     _BLE_CONNECT_LOCK.acquire, True, self.connect_lock_timeout_sec
                 )
@@ -350,7 +453,7 @@ class IMUModelStartStopDetector:
                     sensor = self._build_sensor(connect_target)
                     if sensor is None:
                         return
-                    self._set_error(f"正在连接IMU: {self.mac_address}")
+                    self._set_error(f"正在连接IMU: {self.mac_address}{adapter_note}")
                     await sensor.client.connect(timeout=self.connect_timeout_sec)  # type: ignore[arg-type]
                     sensor.is_connected = True
                     await sensor.configure_sensor()
@@ -375,6 +478,14 @@ class IMUModelStartStopDetector:
 
                     with self._lock:
                         should_measure = bool(self._measurement_enabled)
+                        restart_measurement = bool(self._measurement_restart_requested)
+                        self._measurement_restart_requested = False
+                    if should_measure and restart_measurement and measuring_now:
+                        await sensor.stop_measurement()
+                        measuring_now = False
+                        with self._lock:
+                            self._measuring = False
+                        await asyncio.sleep(0.05)
                     if should_measure and not measuring_now:
                         await sensor.start_measurement()
                         measuring_now = True
@@ -387,7 +498,7 @@ class IMUModelStartStopDetector:
                             self._measuring = False
                     await asyncio.sleep(0.1)
             except Exception as exc:
-                self._set_error(f"IMU连接失败: {exc}")
+                self._set_error(f"IMU连接失败: {_format_exception(exc)}")
             finally:
                 with self._lock:
                     self._connected = False
@@ -405,12 +516,27 @@ class IMUModelStartStopDetector:
 
         self._set_error(f"正在扫描IMU: {target_mac}")
         find_by_address = getattr(BleakScanner, "find_device_by_address", None)
+        scanner_kwargs = _bleak_adapter_kwargs(BleakScanner.discover, self.ble_adapter)
         if callable(find_by_address):
-            device = await find_by_address(target_mac, timeout=self.scan_timeout_sec)
+            try:
+                device = await find_by_address(
+                    target_mac,
+                    timeout=self.scan_timeout_sec,
+                    **scanner_kwargs,
+                )
+            except TypeError:
+                device = await find_by_address(target_mac, timeout=self.scan_timeout_sec)
             if device is not None:
                 return device
 
-        devices = _iter_scanner_devices(await BleakScanner.discover(timeout=self.scan_timeout_sec))
+        try:
+            scan_result = await BleakScanner.discover(
+                timeout=self.scan_timeout_sec,
+                **scanner_kwargs,
+            )
+        except TypeError:
+            scan_result = await BleakScanner.discover(timeout=self.scan_timeout_sec)
+        devices = _iter_scanner_devices(scan_result)
         for device in devices:
             if _normalize_mac(getattr(device, "address", "")) == target_mac:
                 return device
@@ -443,14 +569,22 @@ class IMUModelStartStopDetector:
         sensor = MovellaDOTSensor(
             SensorConfiguration(
                 output_rate=output_rate,
-                filter_profile=FilterProfile.DYNAMIC,
-                payload_mode=PayloadMode.RATE_QUANTITIES,
+                filter_profile=self.filter_profile,
+                payload_mode=self.payload_mode,
             )
         )
         target = connect_target if connect_target is not None else self.mac_address
         target_address = str(getattr(target, "address", self.mac_address) or self.mac_address)
         target_name = str(getattr(target, "name", "") or target_address)
-        sensor.client = BleakClient(target, timeout=self.connect_timeout_sec)
+        client_kwargs = _bleak_adapter_kwargs(BleakClient, self.ble_adapter)
+        try:
+            sensor.client = BleakClient(
+                target,
+                timeout=self.connect_timeout_sec,
+                **client_kwargs,
+            )
+        except TypeError:
+            sensor.client = BleakClient(target, timeout=self.connect_timeout_sec)
         sensor._device_address = target_address
         sensor._device_name = target_name
         return sensor
@@ -495,9 +629,23 @@ class IMUModelStartStopDetector:
 
     def _handle_sample(self, sample_6d: np.ndarray) -> None:
         with self._lock:
-            self._sample_buffer.append(sample_6d)
+            now = time.time()
+            sample = np.asarray(sample_6d, dtype=float).copy()
+            self._latest_sample_6d = sample
+            self._latest_sample_seq += 1
+            self._sample_buffer.append(sample)
             self._sample_seq += 1
-            self._last_sample_time = time.time()
+            self._last_sample_time = now
+
+            if not self.require_model:
+                self._last_prediction = {
+                    "label_id": int(self._stop_label_id),
+                    "predicted_label": "采集中",
+                    "motion_probability": 0.0,
+                    "ready": True,
+                    "timestamp": now,
+                }
+                return
 
             if len(self._sample_buffer) < self._window_size:
                 self._last_prediction["ready"] = False

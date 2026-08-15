@@ -14,10 +14,16 @@ from std_msgs.msg import Float32
 
 from .adaptive_oscillator_estimator import AdaptiveOscillatorEstimator
 from .imu_cycling_toggle_detector import CyclingToggleIMUDetector, DEFAULT_EVENT_PROB_THRESHOLD
+from .imu_phase_estimator import ImuPhaseConfig, ThighImuPhaseEstimator
 from .gait_constants import AO_CONFIG
 from .imu_model_start_stop_detector import IMUModelStartStopDetector
 from .motion_mode_defaults import get_default_motion_modes
 from .phase_bias_fitting import phase_bias_with_smoothing
+from .wired_imu_phase_source import (
+    DEFAULT_CAN_INTERFACE as DEFAULT_IMU_PHASE_CAN_INTERFACE,
+    WiredCanImuPhaseSource,
+    format_can_id,
+)
 from .test_mode_phase_helper import (
     TEST_MODE_PHASE_MAX_CYCLE_SEC,
     TEST_MODE_PHASE_MIN_CYCLE_SEC,
@@ -27,7 +33,16 @@ from .test_mode_phase_helper import (
 
 CYCLING_TOGGLE_MODES = ("cycling", "uphill")
 TEST_PEAK_PHASE_MODES = ("test", "walking_test")
-STAIRS_DOWN_MANUAL_MODES = ("stairs_down", *TEST_PEAK_PHASE_MODES)
+DUAL_IMU_PHASE_MODES = ("imu_phase",)
+SINGLE_IMU_PHASE_MODES = ("imu_left_phase",)
+IMU_PHASE_MODES = (*DUAL_IMU_PHASE_MODES, *SINGLE_IMU_PHASE_MODES)
+STAIRS_DOWN_MANUAL_MODES = ("stairs_down", *TEST_PEAK_PHASE_MODES, *IMU_PHASE_MODES)
+DEFAULT_IMU_PHASE_SWING_THRESHOLD_DEG = 25.0
+DEFAULT_IMU_PHASE_LEFT_MAC = "D4:22:CD:00:84:61"
+DEFAULT_IMU_PHASE_RIGHT_MAC = "D4:22:CD:00:83:98"
+DEFAULT_WALKING_IMU_MAC = "D4:22:CD:00:8A:5A"
+DEFAULT_CYCLING_SLOT_IMU_MAC = "D4:22:CD:00:8A:5B"
+WIRED_IMU_PHASE_SOURCE_NAMES = ("can", "wired", "wired_can", "socketcan")
 
 # 相位输入/停止态预览门控（便于集中调参）
 PHASE_PREVIEW_WINDOW_SEC = 0.5       # 门控RMS统计窗口时长（秒）
@@ -40,6 +55,22 @@ PHASE_INPUT_DEADZONE_ANGLE = 0.1     # 相位输入角度死区：|angle_diff|<�
 # 停止->运动切换时的起步初始相位参数（便于现场快速调参）
 START_PHASE_INIT_LEFT_FIRST = 0.0    # 左脚先迈时，左腿相位初始值（rad）
 START_PHASE_INIT_RIGHT_FIRST = np.pi # 右脚先迈时，左腿相位初始值（rad）
+
+
+def _read_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+def _env_enabled(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 class RealTimeGaitAnalysis(Node):
     """实时步态分析节点，支持多种运动模式和参数调整"""
     
@@ -136,6 +167,90 @@ class RealTimeGaitAnalysis(Node):
         self.test_mode_right_phase_valid = False
         self.test_mode_left_assist_ready = False
         self.test_mode_right_assist_ready = False
+
+        # IMU相位模式：默认使用有线 Xsens MTi SocketCAN 输出作为左/右大腿相位源。
+        self.imu_phase_source_kind = str(
+            os.environ.get("GAIT_IMU_PHASE_SOURCE", "can")
+        ).strip().lower()
+        self.imu_phase_is_wired = self.imu_phase_source_kind in WIRED_IMU_PHASE_SOURCE_NAMES
+        default_phase_angle_sign = -1.0 if self.imu_phase_is_wired else 1.0
+        default_phase_gyro_sign = -1.0 if self.imu_phase_is_wired else 1.0
+        self.imu_phase_swing_threshold = float(
+            self.motion_modes.get("imu_phase", {}).get(
+                "swing_threshold",
+                DEFAULT_IMU_PHASE_SWING_THRESHOLD_DEG,
+            )
+        )
+        gyro_unit = os.environ.get("GAIT_IMU_PHASE_GYRO_UNIT", "deg")
+        common_phase_offset = _read_env_float("GAIT_IMU_PHASE_OFFSET", 0.0)
+        imu_phase_motion_timeout_sec = max(
+            0.05,
+            _read_env_float("GAIT_IMU_PHASE_MOTION_TIMEOUT_SEC", 0.45),
+        )
+        imu_phase_end_stop_threshold = max(
+            0.0,
+            min(1.0, _read_env_float("GAIT_IMU_PHASE_END_STOP_THRESHOLD", 0.98)),
+        )
+        imu_phase_motion_swing_range_ratio = max(
+            0.0,
+            min(1.0, _read_env_float("GAIT_IMU_PHASE_MOTION_SWING_RANGE_RATIO", 0.25)),
+        )
+        self.imu_phase_left_estimator = ThighImuPhaseEstimator(
+            ImuPhaseConfig(
+                angle_sign=_read_env_float(
+                    "GAIT_IMU_PHASE_LEFT_ANGLE_SIGN",
+                    default_phase_angle_sign,
+                ),
+                gyro_sign=_read_env_float(
+                    "GAIT_IMU_PHASE_LEFT_GYRO_SIGN",
+                    default_phase_gyro_sign,
+                ),
+                gyro_unit=gyro_unit,
+                phase_offset=_read_env_float("GAIT_IMU_PHASE_LEFT_OFFSET", common_phase_offset),
+                min_swing_range_deg=self.imu_phase_swing_threshold,
+                motion_timeout_sec=imu_phase_motion_timeout_sec,
+                end_phase_stop_threshold=imu_phase_end_stop_threshold,
+                motion_swing_range_ratio=imu_phase_motion_swing_range_ratio,
+            )
+        )
+        self.imu_phase_right_estimator = ThighImuPhaseEstimator(
+            ImuPhaseConfig(
+                angle_sign=_read_env_float(
+                    "GAIT_IMU_PHASE_RIGHT_ANGLE_SIGN",
+                    default_phase_angle_sign,
+                ),
+                gyro_sign=_read_env_float(
+                    "GAIT_IMU_PHASE_RIGHT_GYRO_SIGN",
+                    default_phase_gyro_sign,
+                ),
+                gyro_unit=gyro_unit,
+                phase_offset=_read_env_float("GAIT_IMU_PHASE_RIGHT_OFFSET", common_phase_offset),
+                min_swing_range_deg=self.imu_phase_swing_threshold,
+                motion_timeout_sec=imu_phase_motion_timeout_sec,
+                end_phase_stop_threshold=imu_phase_end_stop_threshold,
+                motion_swing_range_ratio=imu_phase_motion_swing_range_ratio,
+            )
+        )
+        self.imu_phase_last_left_seq = 0
+        self.imu_phase_last_right_seq = 0
+        self.imu_phase_left_output = None
+        self.imu_phase_right_output = None
+        self.imu_phase_left_zero_event = False
+        self.imu_phase_right_zero_event = False
+        self.imu_phase_left_valid = False
+        self.imu_phase_right_valid = False
+        self.imu_phase_valid = False
+        self.imu_phase_left_motion_active = False
+        self.imu_phase_right_motion_active = False
+        self.imu_phase_motion_active = False
+        self.imu_phase_left_angle_deg = 0.0
+        self.imu_phase_right_angle_deg = 0.0
+        self.imu_phase_left_angular_velocity_deg_s = 0.0
+        self.imu_phase_right_angular_velocity_deg_s = 0.0
+        self.imu_phase_left_swing_range_deg = 0.0
+        self.imu_phase_right_swing_range_deg = 0.0
+        self.imu_phase_left_frequency_hz = 0.0
+        self.imu_phase_right_frequency_hz = 0.0
         
         # 步态开始/结束检测参数（仅使用IMU模型）
         self.timer_r = 0.0  # 仅用于调试输出
@@ -160,7 +275,7 @@ class RealTimeGaitAnalysis(Node):
         self.imu_model_init_error = ""
         self.imu_model_detector = None
         imu_model_path = os.environ.get("GAIT_IMU_MODEL_PATH", "")
-        imu_mac = os.environ.get("GAIT_IMU_MAC", "D4:22:CD:00:8A:5A")
+        imu_mac = os.environ.get("GAIT_IMU_MAC", DEFAULT_WALKING_IMU_MAC)
         self.imu_model_info = {
             "connected": False,
             "mac_address": imu_mac,
@@ -199,7 +314,10 @@ class RealTimeGaitAnalysis(Node):
         self.cycling_toggle_info = {}
         self.cycling_toggle_detector = None
         cycling_model_path = os.environ.get("GAIT_CYCLING_IMU_MODEL_PATH", "")
-        cycling_imu_mac = os.environ.get("GAIT_CYCLING_IMU_MAC", "D4:22:CD:00:8A:5B")
+        cycling_imu_mac = os.environ.get(
+            "GAIT_CYCLING_IMU_MAC",
+            DEFAULT_CYCLING_SLOT_IMU_MAC,
+        )
         try:
             cycling_event_consecutive = max(
                 1, int(os.environ.get("GAIT_CYCLING_EVENT_CONSECUTIVE", "2"))
@@ -251,6 +369,128 @@ class RealTimeGaitAnalysis(Node):
         except Exception as exc:
             self.get_logger().warn(f"⚠️ cycling/uphill启停模型初始化失败，将保持停止状态: {exc}")
             self.cycling_toggle_detector = None
+
+        self.imu_phase_left_info = {}
+        self.imu_phase_right_info = {}
+        self.imu_phase_left_detector = None
+        self.imu_phase_right_detector = None
+        if self.imu_phase_is_wired:
+            imu_phase_can_interface = os.environ.get(
+                "GAIT_IMU_PHASE_CAN_INTERFACE",
+                DEFAULT_IMU_PHASE_CAN_INTERFACE,
+            ).strip() or DEFAULT_IMU_PHASE_CAN_INTERFACE
+            imu_phase_data_timeout = max(
+                0.05,
+                _read_env_float("GAIT_IMU_PHASE_DATA_TIMEOUT_SEC", 0.5),
+            )
+            for side, attr_name, info_attr, label in (
+                ("left", "imu_phase_left_detector", "imu_phase_left_info", "左腿"),
+                ("right", "imu_phase_right_detector", "imu_phase_right_info", "右腿"),
+            ):
+                try:
+                    detector = WiredCanImuPhaseSource(
+                        side=side,
+                        interface=imu_phase_can_interface,
+                        data_timeout_sec=imu_phase_data_timeout,
+                    )
+                    setattr(self, attr_name, detector)
+                    ids = ", ".join(
+                        f"{name}={format_can_id(can_id)}"
+                        for name, can_id in detector.frame_ids.items()
+                    )
+                    setattr(
+                        self,
+                        info_attr,
+                        {
+                            "connected": False,
+                            "measuring": False,
+                            "ready": False,
+                            "stale": True,
+                            "mac_address": detector.mac_address,
+                            "predicted_label": f"有线CAN{label}",
+                            "last_error": "",
+                        },
+                    )
+                    self.get_logger().info(
+                        f"🦵 IMU相位{label}有线CAN源已就绪(未连接): "
+                        f"interface={imu_phase_can_interface}, {ids}"
+                    )
+                except Exception as exc:
+                    getattr(self, info_attr).update({"last_error": str(exc)})
+                    self.get_logger().warn(f"⚠️ IMU相位{label}有线CAN源初始化失败: {exc}")
+                    setattr(self, attr_name, None)
+        else:
+            imu_phase_left_mac = os.environ.get(
+                "GAIT_IMU_PHASE_LEFT_MAC",
+                DEFAULT_IMU_PHASE_LEFT_MAC,
+            )
+            imu_phase_right_mac = os.environ.get(
+                "GAIT_IMU_PHASE_RIGHT_MAC",
+                DEFAULT_IMU_PHASE_RIGHT_MAC,
+            )
+            imu_phase_connect_timeout = max(
+                1.0,
+                _read_env_float("GAIT_IMU_PHASE_CONNECT_TIMEOUT_SEC", 15.0),
+            )
+            imu_phase_reconnect_interval = max(
+                0.5,
+                _read_env_float("GAIT_IMU_PHASE_RECONNECT_INTERVAL_SEC", 5.0),
+            )
+            imu_phase_scan_before_connect = _env_enabled(
+                "GAIT_IMU_PHASE_SCAN_BEFORE_CONNECT",
+                True,
+            )
+            try:
+                self.imu_phase_left_detector = IMUModelStartStopDetector(
+                    model_path=None,
+                    mac_address=imu_phase_left_mac,
+                    sample_rate_hz=30.0,
+                    connect_timeout_sec=imu_phase_connect_timeout,
+                    reconnect_interval_sec=imu_phase_reconnect_interval,
+                    require_model=False,
+                    scan_before_connect=imu_phase_scan_before_connect,
+                )
+                init_err = str(self.imu_phase_left_detector.last_error or "").strip()
+                if init_err:
+                    self.imu_phase_left_info.update({"last_error": init_err})
+                    self.get_logger().warn(
+                        f"⚠️ IMU相位左腿IMU不可用: {self.imu_phase_left_detector.last_error}"
+                    )
+                    self.imu_phase_left_detector = None
+                else:
+                    self.get_logger().info(
+                        f"🦵 IMU相位左腿IMU已就绪(未连接): mac={imu_phase_left_mac}"
+                    )
+            except Exception as exc:
+                self.imu_phase_left_info.update({"last_error": str(exc)})
+                self.get_logger().warn(f"⚠️ IMU相位左腿IMU初始化失败: {exc}")
+                self.imu_phase_left_detector = None
+
+            try:
+                self.imu_phase_right_detector = IMUModelStartStopDetector(
+                    model_path=None,
+                    mac_address=imu_phase_right_mac,
+                    sample_rate_hz=30.0,
+                    connect_timeout_sec=imu_phase_connect_timeout,
+                    reconnect_interval_sec=imu_phase_reconnect_interval,
+                    require_model=False,
+                    scan_before_connect=imu_phase_scan_before_connect,
+                )
+                init_err = str(self.imu_phase_right_detector.last_error or "").strip()
+                if init_err:
+                    self.imu_phase_right_info.update({"last_error": init_err})
+                    self.get_logger().warn(
+                        f"⚠️ IMU相位右腿IMU不可用: {self.imu_phase_right_detector.last_error}"
+                    )
+                    self.imu_phase_right_detector = None
+                else:
+                    self.get_logger().info(
+                        f"🦵 IMU相位右腿IMU已就绪(未连接): mac={imu_phase_right_mac}"
+                    )
+            except Exception as exc:
+                self.imu_phase_right_info.update({"last_error": str(exc)})
+                self.get_logger().warn(f"⚠️ IMU相位右腿IMU初始化失败: {exc}")
+                self.imu_phase_right_detector = None
         
         # 数据记录配置
         self.data_logging_enabled = True  # 启用数据记录
@@ -409,6 +649,21 @@ class RealTimeGaitAnalysis(Node):
                 event_prob_threshold_default,
                 event_prob_threshold_descriptor,
             )
+
+            swing_threshold_default = float(
+                mode_info.get("swing_threshold", DEFAULT_IMU_PHASE_SWING_THRESHOLD_DEG)
+            )
+            self.motion_modes[mode_key]["swing_threshold"] = swing_threshold_default
+            swing_threshold_param_name = f"{mode_key}.swing_threshold"
+            swing_threshold_descriptor = ParameterDescriptor(
+                description=f"{mode_info['name']}的IMU摆幅阈值 (deg，仅IMU相位模式生效)",
+                type=ParameterType.PARAMETER_DOUBLE,
+            )
+            self.declare_parameter(
+                swing_threshold_param_name,
+                swing_threshold_default,
+                swing_threshold_descriptor,
+            )
         
         # 初始频率固定为1Hz，不再作为可调参数
     
@@ -527,26 +782,24 @@ class RealTimeGaitAnalysis(Node):
                 self.csv_writer = None
 
     def close_imu_model_detector(self):
-        """关闭IMU模型判停器（walking + cycling）。"""
-        detector = getattr(self, "imu_model_detector", None)
-        if detector is not None:
+        """关闭所有gait侧IMU连接器。"""
+        detector_specs = (
+            ("imu_model_detector", "walking IMU模型判停"),
+            ("cycling_toggle_detector", "cycling IMU模型判停"),
+            ("imu_phase_left_detector", "IMU相位左腿IMU"),
+            ("imu_phase_right_detector", "IMU相位右腿IMU"),
+        )
+        for attr_name, label in detector_specs:
+            detector = getattr(self, attr_name, None)
+            if detector is None:
+                continue
             try:
                 detector.stop()
-                self.get_logger().info("📴 walking IMU模型判停已关闭")
+                self.get_logger().info(f"📴 {label}已关闭")
             except Exception as exc:
-                self.get_logger().warn(f"⚠️ 关闭walking IMU模型判停失败: {exc}")
+                self.get_logger().warn(f"⚠️ 关闭{label}失败: {exc}")
             finally:
-                self.imu_model_detector = None
-
-        cycling_detector = getattr(self, "cycling_toggle_detector", None)
-        if cycling_detector is not None:
-            try:
-                cycling_detector.stop()
-                self.get_logger().info("📴 cycling IMU模型判停已关闭")
-            except Exception as exc:
-                self.get_logger().warn(f"⚠️ 关闭cycling IMU模型判停失败: {exc}")
-            finally:
-                self.cycling_toggle_detector = None
+                setattr(self, attr_name, None)
 
     def _is_valid_mac(self, value: str) -> bool:
         parts = value.strip().split(":")
@@ -561,23 +814,56 @@ class RealTimeGaitAnalysis(Node):
         info = dict(fallback_info or {})
         if detector is not None:
             # 必须以检测器实时状态为准，不能用 fallback 的旧值覆盖连接状态。
-            info["connected"] = bool(getattr(detector, "_connected", False))
-            info["measuring"] = bool(getattr(detector, "_measuring", False))
+            connected_now = bool(getattr(detector, "_connected", False))
+            measuring_now = bool(getattr(detector, "_measuring", False))
+            info["connected"] = connected_now
+            info["measuring"] = measuring_now
             info["mac_address"] = str(getattr(detector, "mac_address", fallback_mac))
             info["last_error"] = str(getattr(detector, "last_error", "") or "")
+            latest_sample = (
+                detector.get_latest_sample_6d()
+                if hasattr(detector, "get_latest_sample_6d")
+                else None
+            )
+            if not connected_now or not measuring_now or latest_sample is None:
+                info["ready"] = False
+                info["stale"] = True
+            else:
+                _sample, sample_time, _seq = latest_sample
+                timeout_sec = float(getattr(detector, "data_timeout_sec", 1.0))
+                sample_stale = (time.time() - float(sample_time)) > max(timeout_sec, 0.1)
+                info["ready"] = not sample_stale
+                info["stale"] = sample_stale
         return {
             "connected": bool(info.get("connected", False)),
             "measuring": bool(info.get("measuring", False)),
             "ready": bool(info.get("ready", False)),
             "stale": bool(info.get("stale", True)),
             "mac": str(info.get("mac_address", fallback_mac)),
+            "ble_adapter": str(info.get("ble_adapter", "")),
             "label": str(info.get("predicted_label", "")),
             "last_error": str(info.get("last_error", init_err or "")),
         }
 
     def get_imu_connection_status(self):
-        walking_mac = os.environ.get("GAIT_IMU_MAC", "D4:22:CD:00:8A:5A")
-        cycling_mac = os.environ.get("GAIT_CYCLING_IMU_MAC", "D4:22:CD:00:8A:5B")
+        walking_mac = os.environ.get("GAIT_IMU_MAC", DEFAULT_WALKING_IMU_MAC)
+        cycling_mac = os.environ.get("GAIT_CYCLING_IMU_MAC", DEFAULT_CYCLING_SLOT_IMU_MAC)
+        if getattr(self, "imu_phase_is_wired", False):
+            imu_phase_interface = os.environ.get(
+                "GAIT_IMU_PHASE_CAN_INTERFACE",
+                DEFAULT_IMU_PHASE_CAN_INTERFACE,
+            ).strip() or DEFAULT_IMU_PHASE_CAN_INTERFACE
+            imu_phase_left_mac = f"wired:{imu_phase_interface}:left"
+            imu_phase_right_mac = f"wired:{imu_phase_interface}:right"
+        else:
+            imu_phase_left_mac = os.environ.get(
+                "GAIT_IMU_PHASE_LEFT_MAC",
+                DEFAULT_IMU_PHASE_LEFT_MAC,
+            )
+            imu_phase_right_mac = os.environ.get(
+                "GAIT_IMU_PHASE_RIGHT_MAC",
+                DEFAULT_IMU_PHASE_RIGHT_MAC,
+            )
         walking = self._collect_detector_status(
             detector=getattr(self, "imu_model_detector", None),
             fallback_info=getattr(self, "imu_model_info", {}) or {},
@@ -590,19 +876,36 @@ class RealTimeGaitAnalysis(Node):
             fallback_mac=cycling_mac,
             init_err="",
         )
-        return {"walking": walking, "cycling": cycling}
+        imu_phase_left = self._collect_detector_status(
+            detector=getattr(self, "imu_phase_left_detector", None),
+            fallback_info=getattr(self, "imu_phase_left_info", {}) or {},
+            fallback_mac=imu_phase_left_mac,
+            init_err="",
+        )
+        imu_phase_right = self._collect_detector_status(
+            detector=getattr(self, "imu_phase_right_detector", None),
+            fallback_info=getattr(self, "imu_phase_right_info", {}) or {},
+            fallback_mac=imu_phase_right_mac,
+            init_err="",
+        )
+        return {
+            "walking": walking,
+            "cycling": cycling,
+            "imu_phase_left": imu_phase_left,
+            "imu_phase_right": imu_phase_right,
+        }
 
     def set_imu_measurement_enabled(self, enabled: bool, slot: str | None = None):
         target = bool(enabled)
         slot_key = str(slot).strip().lower() if slot is not None else ""
-        selected_slots = ("walking", "cycling")
+        selected_slots = ("walking", "cycling", "imu_phase_left", "imu_phase_right")
         if slot is not None:
             if slot_key not in selected_slots:
                 return {"ok": False, "reason": "invalid_slot", "slot": slot_key}
             selected_slots = (slot_key,)
 
         for current_slot in selected_slots:
-            detector_attr = "imu_model_detector" if current_slot == "walking" else "cycling_toggle_detector"
+            detector_attr = self._imu_detector_attr_for_slot(current_slot)
             detector = getattr(self, detector_attr, None)
             if detector is None:
                 continue
@@ -616,23 +919,75 @@ class RealTimeGaitAnalysis(Node):
         """Return whether a slot should stream notifications in the current motion mode."""
         slot_key = str(slot).strip().lower()
         mode = str(getattr(self, "current_motion_mode", "walking"))
+        phase_keep_default = not bool(getattr(self, "imu_phase_is_wired", False))
+        if mode in SINGLE_IMU_PHASE_MODES:
+            return slot_key == "imu_phase_left"
+        if mode in IMU_PHASE_MODES:
+            return slot_key in ("imu_phase_left", "imu_phase_right")
+        if (
+            slot_key == "imu_phase_left"
+            and _env_enabled("GAIT_IMU_PHASE_KEEP_STREAMING", phase_keep_default)
+        ):
+            return True
         if mode in CYCLING_TOGGLE_MODES:
             return slot_key == "cycling"
         if mode in STAIRS_DOWN_MANUAL_MODES:
             return False
         return slot_key == "walking"
 
+    def _imu_detector_attr_for_slot(self, slot_key: str) -> str:
+        return {
+            "walking": "imu_model_detector",
+            "cycling": "cycling_toggle_detector",
+            "imu_phase_left": "imu_phase_left_detector",
+            "imu_phase_right": "imu_phase_right_detector",
+        }.get(str(slot_key).strip().lower(), "")
+
+    def _default_mac_for_imu_slot(self, slot_key: str) -> str:
+        slot_key = str(slot_key).strip().lower()
+        if slot_key == "walking":
+            return os.environ.get("GAIT_IMU_MAC", DEFAULT_WALKING_IMU_MAC).strip().upper()
+        if slot_key == "cycling":
+            return os.environ.get(
+                "GAIT_CYCLING_IMU_MAC",
+                DEFAULT_CYCLING_SLOT_IMU_MAC,
+            ).strip().upper()
+        if slot_key == "imu_phase_left":
+            if getattr(self, "imu_phase_is_wired", False):
+                return ""
+            return os.environ.get(
+                "GAIT_IMU_PHASE_LEFT_MAC",
+                DEFAULT_IMU_PHASE_LEFT_MAC,
+            ).strip().upper()
+        if slot_key == "imu_phase_right":
+            if getattr(self, "imu_phase_is_wired", False):
+                return ""
+            return os.environ.get(
+                "GAIT_IMU_PHASE_RIGHT_MAC",
+                DEFAULT_IMU_PHASE_RIGHT_MAC,
+            ).strip().upper()
+        return ""
+
     def control_imu_connection(self, slot: str, connect: bool, mac: str = ""):
         slot_key = str(slot).strip().lower()
-        if slot_key not in ("walking", "cycling"):
+        valid_slots = ("walking", "cycling", "imu_phase_left", "imu_phase_right")
+        if slot_key not in valid_slots:
             return {"ok": False, "slot": slot_key, "reason": "invalid_slot"}
 
-        detector_attr = "imu_model_detector" if slot_key == "walking" else "cycling_toggle_detector"
+        detector_attr = self._imu_detector_attr_for_slot(slot_key)
         detector = getattr(self, detector_attr, None)
         if detector is None:
             return {"ok": False, "slot": slot_key, "reason": "detector_unavailable"}
 
         normalized_mac = (mac or "").strip().upper()
+        phase_slot_uses_wired = (
+            slot_key in ("imu_phase_left", "imu_phase_right")
+            and getattr(self, "imu_phase_is_wired", False)
+        )
+        if phase_slot_uses_wired:
+            normalized_mac = ""
+        elif slot_key in ("imu_phase_left", "imu_phase_right") or not normalized_mac:
+            normalized_mac = self._default_mac_for_imu_slot(slot_key)
         if normalized_mac:
             if not self._is_valid_mac(normalized_mac):
                 return {"ok": False, "slot": slot_key, "reason": "invalid_mac"}
@@ -645,9 +1000,9 @@ class RealTimeGaitAnalysis(Node):
 
         try:
             if connect:
-                should_measure = bool(
-                    getattr(getattr(self, "motor_controller_ref", None), "mechanical_zeroed", False)
-                ) and self.should_measure_imu_slot(slot_key)
+                # 连接命令只负责让主控连接 IMU。是否进入测量流由当前模式决定，
+                # 不依赖电机标零状态，避免 APP 在助力启动前连接 IMU 时被置为不可测量。
+                should_measure = self.should_measure_imu_slot(slot_key)
                 detector.set_measurement_enabled(should_measure)
                 started = bool(detector.start())
                 if not started:
@@ -711,7 +1066,7 @@ class RealTimeGaitAnalysis(Node):
                     if param_type in ['ext_t0', 'ext_tf', 'ext_p', 'ext_Tmax', 
                                      'flex_t0', 'flex_tf', 'flex_p', 'flex_Tmax',
                                      'phase_bias', 'phase_bias_at_0p6', 'phase_bias_slope',
-                                     'event_prob_threshold']:
+                                     'event_prob_threshold', 'swing_threshold']:
                         # 验证参数值范围
                         if param_type in ['ext_t0', 'ext_tf', 'flex_t0', 'flex_tf']:
                             # 时刻参数: 归一化相位 0-1
@@ -829,6 +1184,27 @@ class RealTimeGaitAnalysis(Node):
                                 )
                                 return SetParametersResult(successful=False,
                                                          reason="启停事件概率阈值超出允许范围 (0.0到1.0)")
+                        elif param_type == 'swing_threshold':
+                            # IMU相位摆幅阈值: 0 到 90 deg
+                            if 0.0 <= param_value <= 90.0:
+                                self.motion_modes[mode_key][param_type] = param_value
+                                if mode_key in IMU_PHASE_MODES:
+                                    self.imu_phase_swing_threshold = float(param_value)
+                                    self.imu_phase_left_estimator.update_swing_threshold(param_value)
+                                    self.imu_phase_right_estimator.update_swing_threshold(param_value)
+                                    effect = "当前模式已生效" if self.current_motion_mode == mode_key else "切换到该模式后生效"
+                                else:
+                                    effect = "当前模式不使用"
+                                self.get_logger().info(
+                                    f"参数更新: {self.motion_modes[mode_key]['name']} "
+                                    f"swing_threshold = {param_value:.2f} deg ({effect})"
+                                )
+                            else:
+                                self.get_logger().warn(
+                                    f"IMU摆幅阈值超出范围 (0.0到90.0 deg): {param_name} = {param_value}"
+                                )
+                                return SetParametersResult(successful=False,
+                                                         reason="IMU摆幅阈值超出允许范围 (0.0到90.0 deg)")
                     else:
                         self.get_logger().warn(f"未知参数类型: {param_type}")
                         return SetParametersResult(successful=False, 
@@ -880,6 +1256,27 @@ class RealTimeGaitAnalysis(Node):
                 print(f"   - {mode}模型阈值: {threshold:.3f}")
                 return True
 
+            if mode in IMU_PHASE_MODES:
+                self.stairs_down_manual_assist_enabled = False
+                self.assist_enable = False
+                self.assist_wait_next_zero = False
+                self._assist_zero_prev_phase = None
+                self.gait_state = 0
+                self.reset_phase_estimator()
+                threshold = float(
+                    current_params.get("swing_threshold", self.imu_phase_swing_threshold)
+                )
+                self.imu_phase_swing_threshold = threshold
+                self.imu_phase_left_estimator.update_swing_threshold(threshold)
+                self.imu_phase_right_estimator.update_swing_threshold(threshold)
+                source_text = "有线CAN大腿IMU" if self.imu_phase_is_wired else "大腿IMU"
+                if mode in SINGLE_IMU_PHASE_MODES:
+                    print(f"   - 相位来源: 左{source_text}，右腿相位=左腿相位+pi")
+                else:
+                    print(f"   - 相位来源: 左右{source_text}")
+                print(f"   - IMU摆幅阈值: {threshold:.2f} deg")
+                print(f"   - {mode}启停状态: 手动按钮控制（默认关闭）")
+                return True
             if mode in STAIRS_DOWN_MANUAL_MODES:
                 self.stairs_down_manual_assist_enabled = False
                 self.assist_enable = False
@@ -897,11 +1294,11 @@ class RealTimeGaitAnalysis(Node):
             return False
 
     def set_stairs_down_manual_assist(self, enabled: bool | None = None):
-        """设置/切换 stairs_down/test/walking_test 模式手动启停状态（按钮控制）。"""
+        """设置/切换手动启停模式的助力状态（按钮控制）。"""
         if self.current_motion_mode not in STAIRS_DOWN_MANUAL_MODES:
             return {
                 "ok": False,
-                "reason": "mode_not_stairs_down_or_test_family",
+                "reason": "mode_not_manual_assist",
                 "mode": self.current_motion_mode,
                 "enabled": bool(getattr(self, "stairs_down_manual_assist_enabled", False)),
             }
@@ -1368,7 +1765,7 @@ class RealTimeGaitAnalysis(Node):
         return self.assist_enable
 
     def _gait_start_stop_detection_by_stairs_down_manual(self):
-        """stairs_down/test模式：由按钮直接控制助力启停，不使用IMU模型。"""
+        """手动启停模式：由按钮直接控制助力启停，不使用启停模型。"""
         mode_name = self.motion_modes.get(self.current_motion_mode, {}).get(
             "name", self.current_motion_mode
         )
@@ -1412,7 +1809,7 @@ class RealTimeGaitAnalysis(Node):
             err = str(getattr(self, "imu_model_init_error", "") or "imu_detector_unavailable")
             self.imu_model_info = {
                 "connected": False,
-                "mac_address": os.environ.get("GAIT_IMU_MAC", "D4:22:CD:00:8A:5A"),
+                "mac_address": os.environ.get("GAIT_IMU_MAC", DEFAULT_WALKING_IMU_MAC),
                 "predicted_label": "停止",
                 "motion_probability": 0.0,
                 "ready": False,
@@ -1518,7 +1915,17 @@ class RealTimeGaitAnalysis(Node):
             if motor_controller.mechanical_zeroed and not motor_controller.motion_confirmed_after_zero:
                 motion_confirm_threshold = 0.4  # 运动确认阈值（rad/s）
                 sustained_motion_time = 1.5  # 需要持续运动的时间（秒）
-                max_velocity = max(abs(left_velocity), abs(right_velocity))
+                if self.current_motion_mode in IMU_PHASE_MODES:
+                    max_velocity = float(
+                        np.deg2rad(
+                            max(
+                                abs(getattr(self, "imu_phase_left_angular_velocity_deg_s", 0.0)),
+                                abs(getattr(self, "imu_phase_right_angular_velocity_deg_s", 0.0)),
+                            )
+                        )
+                    )
+                else:
+                    max_velocity = max(abs(left_velocity), abs(right_velocity))
                 
                 if max_velocity >= motion_confirm_threshold:
                     current_time = time.time()
@@ -1580,7 +1987,7 @@ class RealTimeGaitAnalysis(Node):
             err = str(getattr(self, "imu_model_init_error", "") or "imu_detector_unavailable")
             self.imu_model_info = {
                 "connected": False,
-                "mac_address": os.environ.get("GAIT_IMU_MAC", "D4:22:CD:00:8A:5A"),
+                "mac_address": os.environ.get("GAIT_IMU_MAC", DEFAULT_WALKING_IMU_MAC),
                 "predicted_label": "停止",
                 "motion_probability": 0.0,
                 "ready": False,
@@ -1713,6 +2120,30 @@ class RealTimeGaitAnalysis(Node):
         self.test_mode_right_phase_valid = False
         self.test_mode_left_assist_ready = False
         self.test_mode_right_assist_ready = False
+        if hasattr(self, "imu_phase_left_estimator"):
+            self.imu_phase_left_estimator.reset()
+        if hasattr(self, "imu_phase_right_estimator"):
+            self.imu_phase_right_estimator.reset()
+        self.imu_phase_last_left_seq = 0
+        self.imu_phase_last_right_seq = 0
+        self.imu_phase_left_output = None
+        self.imu_phase_right_output = None
+        self.imu_phase_left_zero_event = False
+        self.imu_phase_right_zero_event = False
+        self.imu_phase_left_valid = False
+        self.imu_phase_right_valid = False
+        self.imu_phase_valid = False
+        self.imu_phase_left_motion_active = False
+        self.imu_phase_right_motion_active = False
+        self.imu_phase_motion_active = False
+        self.imu_phase_left_angle_deg = 0.0
+        self.imu_phase_right_angle_deg = 0.0
+        self.imu_phase_left_angular_velocity_deg_s = 0.0
+        self.imu_phase_right_angular_velocity_deg_s = 0.0
+        self.imu_phase_left_swing_range_deg = 0.0
+        self.imu_phase_right_swing_range_deg = 0.0
+        self.imu_phase_left_frequency_hz = 0.0
+        self.imu_phase_right_frequency_hz = 0.0
         self.assist_output_active = False
         self.actual_left_torque = 0.0
         self.actual_right_torque = 0.0
@@ -1900,10 +2331,142 @@ class RealTimeGaitAnalysis(Node):
                 f"L_ready={self.test_mode_left_assist_ready}, R_ready={self.test_mode_right_assist_ready}"
             )
 
+    def _process_imu_phase_side(self, side: str, detector, estimator):
+        """Process one IMU phase side and return the latest estimator output."""
+        if detector is None or not hasattr(detector, "get_latest_sample_6d"):
+            return None
+        latest = detector.get_latest_sample_6d()
+        if latest is None:
+            return None
+        sample, sample_time, seq = latest
+        timeout_sec = float(getattr(detector, "data_timeout_sec", 1.0))
+        if time.time() - float(sample_time) > max(timeout_sec, 0.1):
+            return None
+
+        last_seq_attr = f"imu_phase_last_{side}_seq"
+        output_attr = f"imu_phase_{side}_output"
+        last_seq = int(getattr(self, last_seq_attr, 0))
+        output = getattr(self, output_attr, None)
+        is_new_sample = int(seq) != last_seq
+        if is_new_sample:
+            output = estimator.process_6d(sample, float(sample_time))
+            setattr(self, last_seq_attr, int(seq))
+            setattr(self, output_attr, output)
+
+        if output is None:
+            return None
+
+        setattr(self, f"imu_phase_{side}_angle_deg", float(output.angle_deg))
+        setattr(
+            self,
+            f"imu_phase_{side}_angular_velocity_deg_s",
+            float(output.angular_velocity_deg_s),
+        )
+        setattr(self, f"imu_phase_{side}_swing_range_deg", float(output.current_swing_range_deg))
+        setattr(self, f"imu_phase_{side}_frequency_hz", float(output.previous_cycle_frequency_hz))
+        setattr(self, f"imu_phase_{side}_valid", bool(output.zero_event_count > 0))
+        setattr(self, f"imu_phase_{side}_motion_active", bool(output.motion_active))
+        setattr(self, f"imu_phase_{side}_zero_event", bool(is_new_sample and output.zero_event))
+        return output
+
+    def _extract_imu_phase(self):
+        """IMU相位模式：按当前模式选择双IMU独立相位或左IMU推导右相位。"""
+        single_imu_mode = self.current_motion_mode in SINGLE_IMU_PHASE_MODES
+        left_output = self._process_imu_phase_side(
+            "left",
+            getattr(self, "imu_phase_left_detector", None),
+            self.imu_phase_left_estimator,
+        )
+        right_output = None if single_imu_mode else self._process_imu_phase_side(
+            "right",
+            getattr(self, "imu_phase_right_detector", None),
+            self.imu_phase_right_estimator,
+        )
+
+        left_valid = bool(left_output is not None and left_output.zero_event_count > 0)
+        right_valid = bool(right_output is not None and right_output.zero_event_count > 0)
+        left_motion_active = bool(left_output is not None and left_output.motion_active)
+        right_motion_active = bool(right_output is not None and right_output.motion_active)
+        self.imu_phase_left_valid = left_valid
+        self.imu_phase_right_valid = bool(left_valid if single_imu_mode else right_valid)
+        self.imu_phase_valid = bool(left_valid and (single_imu_mode or right_valid))
+        self.imu_phase_left_motion_active = left_motion_active
+        self.imu_phase_right_motion_active = bool(
+            left_motion_active if single_imu_mode else right_motion_active
+        )
+        self.imu_phase_motion_active = bool(
+            self.imu_phase_valid
+            and left_motion_active
+            and (single_imu_mode or right_motion_active)
+        )
+        if single_imu_mode and left_output is not None:
+            self.imu_phase_right_angle_deg = -float(self.imu_phase_left_angle_deg)
+            self.imu_phase_right_angular_velocity_deg_s = -float(
+                self.imu_phase_left_angular_velocity_deg_s
+            )
+            self.imu_phase_right_swing_range_deg = float(self.imu_phase_left_swing_range_deg)
+            self.imu_phase_right_frequency_hz = float(self.imu_phase_left_frequency_hz)
+            self.imu_phase_right_zero_event = False
+
+        if left_output is not None:
+            self.current_left_phase = self._wrap_to_2pi(float(left_output.phase_rad))
+            self.phi_L = self.current_left_phase
+        if single_imu_mode:
+            self.current_right_phase = self._wrap_to_2pi(self.current_left_phase + np.pi)
+        elif right_output is not None:
+            self.current_right_phase = self._wrap_to_2pi(float(right_output.phase_rad))
+        else:
+            self.current_right_phase = self._wrap_to_2pi(self.current_left_phase + np.pi)
+
+        self.phase_active = bool(self.gait_state == 1 and self.imu_phase_valid)
+        if self.phase_active:
+            self._update_phase_rate_frequency(self.current_left_phase)
+            self._update_phase_peak_frequency(self.current_left_phase)
+        else:
+            self._update_phase_rate_frequency(None)
+            self._update_phase_peak_frequency(None)
+
+        if (
+            self.gait_state == 1
+            and getattr(self, "assist_wait_next_zero", False)
+            and left_output is not None
+            and bool(getattr(self, "imu_phase_left_zero_event", False))
+            and self.imu_phase_valid
+        ):
+            self.assist_wait_next_zero = False
+            self.assist_enable = True
+            self.get_logger().info("IMU相位到达左腿零点，开始输出助力")
+
+        if not hasattr(self, 'left_phase_buffer'):
+            self.left_phase_buffer = deque(maxlen=self.buffer_size)
+            self.right_phase_buffer = deque(maxlen=self.buffer_size)
+        self.left_phase_buffer.append(self.current_left_phase)
+        self.right_phase_buffer.append(self.current_right_phase)
+        self.footp["p"] = list(self.left_phase_buffer)
+        self.footp["pha"] = list(self.gflag)
+
+        if self.debug_mode and self.log_counter % 30 == 0:
+            self.get_logger().info(
+                "IMU相位 - "
+                f"L_angle={self.imu_phase_left_angle_deg:.2f}deg, "
+                f"R_angle={self.imu_phase_right_angle_deg:.2f}deg, "
+                f"L_phase={self.current_left_phase:.2f}rad valid={left_valid}, "
+                f"R_phase={self.current_right_phase:.2f}rad "
+                f"valid={self.imu_phase_right_valid}, "
+                f"motion_active={self.imu_phase_motion_active}, "
+                f"swing_range=L{self.imu_phase_left_swing_range_deg:.1f}/"
+                f"R{self.imu_phase_right_swing_range_deg:.1f}deg, "
+                f"swing_threshold={self.imu_phase_swing_threshold:.1f}deg"
+            )
+
     def extract_foot_phase(self):
         """提取足部相位/频率（test/walking_test使用峰值法，其余模式使用RAO）。"""
         if self.current_motion_mode in TEST_PEAK_PHASE_MODES:
             self._extract_test_mode_phase()
+            return
+
+        if self.current_motion_mode in IMU_PHASE_MODES:
+            self._extract_imu_phase()
             return
 
         if len(self.lhip_buffer) < 1 or len(self.rhip_buffer) < 1:
@@ -2035,12 +2598,26 @@ class RealTimeGaitAnalysis(Node):
             left_torque = self._calculate_hip_assist_quintic(left_phase_normalized, params)
             right_torque = self._calculate_hip_assist_quintic(right_phase_normalized, params)
         
-        # 运动检测/相位有效性：相位被置零或助力关闭时，不输出助力
-        if not self.assist_enable or not getattr(self, "phase_active", False):
+        imu_phase_motion_inactive = (
+            self.current_motion_mode in IMU_PHASE_MODES
+            and not bool(getattr(self, "imu_phase_motion_active", False))
+        )
+
+        # 运动检测/相位有效性：相位被置零、助力关闭或IMU相位未检测到真实运动时，不输出助力
+        if (
+            not self.assist_enable
+            or not getattr(self, "phase_active", False)
+            or imu_phase_motion_inactive
+        ):
             left_torque = 0.0
             right_torque = 0.0
             if self.debug_mode and self.log_counter % 20 == 0:
-                self.get_logger().info("🛑 步态检测：相位未激活或助力关闭，助力输出置零")
+                reason = (
+                    "IMU相位静止/轻微摆动"
+                    if imu_phase_motion_inactive
+                    else "相位未激活或助力关闭"
+                )
+                self.get_logger().info(f"🛑 步态检测：{reason}，助力输出置零")
         
         # 业务层与协议层统一限制为 ±17 Nm。
         left_torque = max(-17.0, min(17.0, left_torque))

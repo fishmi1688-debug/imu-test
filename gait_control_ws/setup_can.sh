@@ -46,6 +46,27 @@ fi
 
 echo "使用系统默认CAN接口: ${CAN_INTERFACE}"
 
+# 如果CAN已经按目标bitrate处于UP状态，默认不要再down/up。
+# 某些有线IMU在CAN控制器重启后不会自动恢复输出，避免启动gait系统时打断已有IMU流。
+CAN_DETAILS="$(ip -details link show "$CAN_INTERFACE" 2>/dev/null || true)"
+CAN_IS_UP=false
+if echo "$CAN_DETAILS" | grep -q -E 'state UP|<[^>]*UP[^>]*>'; then
+    CAN_IS_UP=true
+fi
+CURRENT_BITRATE="$(echo "$CAN_DETAILS" | sed -nE 's/.*bitrate ([0-9]+).*/\1/p' | head -n 1)"
+if [ "${GAIT_CAN_FORCE_RESET:-0}" != "1" ] && [ "$CAN_IS_UP" = true ] && [ "$CURRENT_BITRATE" = "$CAN_BITRATE" ]; then
+    echo "✅ ${CAN_INTERFACE} 已经UP且bitrate=${CAN_BITRATE}，跳过down/up，避免打断IMU输出"
+    exit 0
+fi
+if [ "${GAIT_CAN_NO_RESET:-0}" = "1" ] && [ "$CAN_IS_UP" = true ]; then
+    if [ -n "$CURRENT_BITRATE" ] && [ "$CURRENT_BITRATE" != "$CAN_BITRATE" ]; then
+        echo "⚠️ ${CAN_INTERFACE} 当前bitrate=${CURRENT_BITRATE}，目标bitrate=${CAN_BITRATE}，但GAIT_CAN_NO_RESET=1，跳过重置"
+    else
+        echo "✅ ${CAN_INTERFACE} 已经UP，GAIT_CAN_NO_RESET=1，跳过down/up"
+    fi
+    exit 0
+fi
+
 # 设置CAN接口
 echo "配置CAN接口 ${CAN_INTERFACE}，bitrate=${CAN_BITRATE}..."
 run_can_cmd ip link set "$CAN_INTERFACE" down 2>/dev/null || true

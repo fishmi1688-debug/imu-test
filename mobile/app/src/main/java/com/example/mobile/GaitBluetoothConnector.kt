@@ -113,6 +113,14 @@ class GaitBluetoothConnector(
         private const val CONTROL_FIELD_STATE_FLAGS = 43
         private const val CONTROL_FIELD_STATE_SCORE = 44
         private const val CONTROL_FIELD_STATE_PARAMS = 45
+        private const val CONTROL_FIELD_IMU_PHASE_LEFT_CONNECTED = 46
+        private const val CONTROL_FIELD_IMU_PHASE_LEFT_MEASURING = 47
+        private const val CONTROL_FIELD_IMU_PHASE_LEFT_READY = 48
+        private const val CONTROL_FIELD_IMU_PHASE_LEFT_STALE = 49
+        private const val CONTROL_FIELD_IMU_PHASE_RIGHT_CONNECTED = 50
+        private const val CONTROL_FIELD_IMU_PHASE_RIGHT_MEASURING = 51
+        private const val CONTROL_FIELD_IMU_PHASE_RIGHT_READY = 52
+        private const val CONTROL_FIELD_IMU_PHASE_RIGHT_STALE = 53
         private val ALLOWED_GAIT_DEVICE_NAMES = setOf(
             "ubuntu",
             "zhang-Dell-G15-5520",
@@ -1258,6 +1266,14 @@ class GaitBluetoothConnector(
             CONTROL_FIELD_STATE_GAIT -> asInt()?.let { obj.addProperty("gs", it) }
             CONTROL_FIELD_STATE_FLAGS -> asInt()?.let { obj.addProperty("f", it) }
             CONTROL_FIELD_STATE_SCORE -> asFloat()?.let { obj.addProperty("ds", it) }
+            CONTROL_FIELD_IMU_PHASE_LEFT_CONNECTED -> asBoolInt()?.let { obj.addProperty("iplc", it) }
+            CONTROL_FIELD_IMU_PHASE_LEFT_MEASURING -> asBoolInt()?.let { obj.addProperty("iplq", it) }
+            CONTROL_FIELD_IMU_PHASE_LEFT_READY -> asBoolInt()?.let { obj.addProperty("ipld", it) }
+            CONTROL_FIELD_IMU_PHASE_LEFT_STALE -> asBoolInt()?.let { obj.addProperty("iplz", it) }
+            CONTROL_FIELD_IMU_PHASE_RIGHT_CONNECTED -> asBoolInt()?.let { obj.addProperty("iprc", it) }
+            CONTROL_FIELD_IMU_PHASE_RIGHT_MEASURING -> asBoolInt()?.let { obj.addProperty("iprq", it) }
+            CONTROL_FIELD_IMU_PHASE_RIGHT_READY -> asBoolInt()?.let { obj.addProperty("iprd", it) }
+            CONTROL_FIELD_IMU_PHASE_RIGHT_STALE -> asBoolInt()?.let { obj.addProperty("iprz", it) }
             CONTROL_FIELD_STATE_PARAMS -> {
                 if (valueType == CONTROL_TYPE_BYTES) {
                     decodeParamPairsBytes(value)?.let { obj.add("u", it) }

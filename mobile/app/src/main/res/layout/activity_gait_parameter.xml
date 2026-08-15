@@ -144,6 +144,76 @@
         </LinearLayout>
 
         <LinearLayout
+            android:id="@+id/swingThresholdRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/bg_card"
+            android:orientation="vertical"
+            android:padding="14dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/ui_text_100"
+                android:textColor="@color/header_title"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/swingThresholdLabel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="@string/ui_text_101"
+                android:textColor="@color/text_secondary"
+                android:textSize="13sp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/swingThresholdMinusButton"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:minWidth="0dp"
+                    android:textColor="@android:color/black"
+                    android:background="@drawable/bg_adjust_minus"
+                    android:textAllCaps="false"
+                    android:textSize="20sp"
+                    android:text=""
+                    android:importantForAccessibility="no" />
+
+                <TextView
+                    android:id="@+id/swingThresholdValueView"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:gravity="center"
+                    android:text="@string/value_default_25_0"
+                    android:textColor="@color/header_title"
+                    android:textSize="16sp"
+                    android:textStyle="bold" />
+
+                <Button
+                    android:id="@+id/swingThresholdPlusButton"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:minWidth="0dp"
+                    android:textColor="@android:color/black"
+                    android:background="@drawable/bg_adjust_plus"
+                    android:textAllCaps="false"
+                    android:textSize="20sp"
+                    android:text=""
+                    android:importantForAccessibility="no" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
