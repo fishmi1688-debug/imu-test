@@ -51,6 +51,21 @@ object GaitBluetoothBridge {
         "downhill",
         "imu_phase",
         "imu_left_phase",
+        "model_phase",
+        "imu_left_ao_phase",
+        "imu_ao_phase",
+        "walking_diff_test",
+    )
+    private val IMU_PHASE_MODE_KEYS = setOf(
+        "imu_phase",
+        "imu_left_phase",
+        "model_phase",
+        "imu_left_ao_phase",
+        "imu_ao_phase",
+    )
+    private val LEFT_ONLY_IMU_PHASE_MODE_KEYS = setOf(
+        "imu_left_phase",
+        "imu_left_ao_phase",
     )
 
     data class PlotFrame(
@@ -523,8 +538,8 @@ object GaitBluetoothBridge {
             ?: stringOrNull("iple")
         val phaseRightError = stringOrNull("imu_phase_right_last_error")
             ?: stringOrNull("ipre")
-        val isImuPhaseMode = motionMode == "imu_phase" || motionMode == "imu_left_phase"
-        val isLeftOnlyImuPhaseMode = motionMode == "imu_left_phase"
+        val isImuPhaseMode = motionMode in IMU_PHASE_MODE_KEYS
+        val isLeftOnlyImuPhaseMode = motionMode in LEFT_ONLY_IMU_PHASE_MODE_KEYS
         val imuConnectedForMode = if (isImuPhaseMode) {
             when {
                 phaseLeftConnected != null || phaseRightConnected != null ->

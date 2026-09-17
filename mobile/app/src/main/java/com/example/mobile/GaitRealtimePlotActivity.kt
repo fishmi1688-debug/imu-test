@@ -22,7 +22,22 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
         private const val STATE_FRESH_THRESHOLD_MS = 1500L
         private const val STARTUP_WAIT_PLOT_MS = 4000L
         private const val PLOT_WINDOW_SECONDS = 10
-        private val IMU_PHASE_MODE_KEYS = setOf("imu_phase", "imu_left_phase")
+        private val IMU_PHASE_MODE_KEYS = setOf(
+            "imu_phase",
+            "imu_left_phase",
+            "model_phase",
+            "imu_left_ao_phase",
+            "imu_ao_phase",
+        )
+        private val LEFT_ONLY_IMU_PHASE_MODE_KEYS = setOf(
+            "imu_left_phase",
+            "imu_left_ao_phase",
+        )
+        private val TEST_PHASE_MODE_KEYS = setOf(
+            "test",
+            "walking_test",
+            "walking_diff_test",
+        )
     }
 
     private lateinit var statusView: TextView
@@ -269,7 +284,7 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
             it.leftAngularVelocity != null && it.rightAngularVelocity != null
         } == true
         val isImuPhaseMode = isImuPhasePresentation(frame, state, hasImuVelocityFrame)
-        val isTestMode = motionMode == "test" || motionMode == "walking_test"
+        val isTestMode = motionMode in TEST_PHASE_MODE_KEYS
         val isManualAssistMode = isTestMode ||
             motionMode == "stairs_down" ||
             motionMode in IMU_PHASE_MODE_KEYS
@@ -354,7 +369,7 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
         val testHint = when {
             !isTestMode -> ""
             state?.manualAssistEnabled == false -> "\n测试模式提示: 先到参数页点“开始手动助力”"
-            testAwaitFirstPeak -> "\n测试模式提示: 正在等待左右腿出现首个峰值以建立相位"
+            testAwaitFirstPeak -> "\n测试模式提示: 正在等待峰值以建立相位"
             testSampling -> "\n测试模式提示: 正在采第一周期峰值，第二周期才开始助力"
             testAnyPhaseValid && !testAnyAssistReady ->
                 "\n测试模式提示: 已有相位，但至少一侧还没采满第二个峰值周期"
@@ -390,20 +405,23 @@ class GaitRealtimePlotActivity : AppCompatActivity() {
         }
         if (isImuPhaseMode) {
             val mode = latestStateSnapshot?.motionMode
-            val isLeftOnlyMode = mode == "imu_left_phase"
-            plotTitleView.text = if (isLeftOnlyMode) {
-                "左IMU相位实时数据"
-            } else {
-                "IMU相位实时数据"
+            val isLeftOnlyMode = mode in LEFT_ONLY_IMU_PHASE_MODE_KEYS
+            val isAoMode = mode == "imu_left_ao_phase" || mode == "imu_ao_phase"
+            plotTitleView.text = when {
+                isLeftOnlyMode && isAoMode -> "左IMU AO相位实时数据"
+                isAoMode -> "IMU AO相位实时数据"
+                isLeftOnlyMode -> "左IMU相位实时数据"
+                else -> "IMU相位实时数据"
             }
-            plotSubtitleView.text = if (isLeftOnlyMode) {
-                "左大腿矢状面角度/角速度、左相位推导右相位、左右助力实时曲线"
-            } else {
-                "左右大腿矢状面角度/角速度/相位/左右助力实时曲线"
+            plotSubtitleView.text = when {
+                isLeftOnlyMode && isAoMode -> "左大腿矢状面角度/角速度、左AO相位推导右相位、左右助力实时曲线"
+                isAoMode -> "左右大腿矢状面角度/角速度/AO相位/左右助力实时曲线"
+                isLeftOnlyMode -> "左大腿矢状面角度/角速度、左相位推导右相位、左右助力实时曲线"
+                else -> "左右大腿矢状面角度/角速度/相位/左右助力实时曲线"
             }
             jointLabelView.text = "左右大腿矢状面角度 (deg)"
             angleLabelView.text = "左右大腿矢状面角速度 (deg/s)"
-            phaseLabelView.text = "IMU相位 (rad)"
+            phaseLabelView.text = if (isAoMode) "IMU AO相位 (rad)" else "IMU相位 (rad)"
             assistLabelView.text = "左右助力 (Nm)"
             leftJointDataSet.label = "LeftThighSagittalAngle"
             rightJointDataSet.label = if (isLeftOnlyMode) {

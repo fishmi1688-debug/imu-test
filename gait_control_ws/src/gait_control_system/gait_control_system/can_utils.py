@@ -75,6 +75,38 @@ def setup_can_interface():
     if exists.returncode != 0:
         raise Exception(f"未找到默认CAN接口 {CAN_INTERFACE}，请检查系统网络接口配置")
 
+    details = subprocess.run(
+        ["ip", "-details", "link", "show", CAN_INTERFACE],
+        capture_output=True,
+        text=True,
+    )
+    details_text = details.stdout or ""
+    can_is_up = ("state UP" in details_text) or ("<" in details_text and "UP" in details_text)
+    current_bitrate = ""
+    tokens = details_text.replace("\n", " ").split()
+    for index, token in enumerate(tokens[:-1]):
+        if token == "bitrate":
+            current_bitrate = tokens[index + 1]
+            break
+
+    if (
+        os.environ.get("GAIT_CAN_FORCE_RESET", "0") != "1"
+        and can_is_up
+        and current_bitrate == CAN_BITRATE
+    ):
+        print(f"✅ {CAN_INTERFACE} 已经UP且bitrate={CAN_BITRATE}，跳过Python端CAN重置")
+        return
+
+    if os.environ.get("GAIT_CAN_NO_RESET", "0") == "1" and can_is_up:
+        if current_bitrate and current_bitrate != CAN_BITRATE:
+            print(
+                f"⚠️ {CAN_INTERFACE} 当前bitrate={current_bitrate}，目标bitrate={CAN_BITRATE}，"
+                "但GAIT_CAN_NO_RESET=1，跳过Python端CAN重置"
+            )
+        else:
+            print(f"✅ {CAN_INTERFACE} 已经UP，GAIT_CAN_NO_RESET=1，跳过Python端CAN重置")
+        return
+
     permission_blocked = False
     _run_can_command(["ip", "link", "set", CAN_INTERFACE, "down"], runner_prefix, quiet=True)
     result, perm_denied = _run_can_command(

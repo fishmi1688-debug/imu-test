@@ -13,9 +13,13 @@ import android.view.MotionEvent
 import android.view.View
 import androidx.core.content.ContextCompat
 import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 class AssistCurveEditorView @JvmOverloads constructor(
     context: Context,
@@ -24,13 +28,17 @@ class AssistCurveEditorView @JvmOverloads constructor(
 ) : View(context, attrs, defStyleAttr) {
 
     companion object {
-        private const val phaseMin = -1.0
-        private const val phaseMax = 1.0
+        private const val phaseMin = -0.5
+        private const val phaseMax = 0.5
         private const val phaseStep = 0.01
         private const val torqueMax = 17.0
         private const val torqueStep = 0.1
         private const val phasePointStep = 0.01
         private const val minPhaseGap = 0.02
+        private const val phaseComfortLower = -0.35
+        private const val phaseComfortUpper = 0.35
+        private const val fullCircleRadians = 6.283185307179586
+        private const val phaseOvalStartAngle = -1.5707963267948966
     }
 
     private enum class DragTarget {
@@ -49,8 +57,9 @@ class AssistCurveEditorView @JvmOverloads constructor(
     private data class Geometry(
         val graphRect: RectF,
         val zeroY: Float,
-        val torqueSliderX: Float,
-        val phaseSliderY: Float
+        val extensionSliderY: Float,
+        val flexionSliderY: Float,
+        val phaseOvalRect: RectF
     )
 
     private data class Handle(
@@ -151,10 +160,16 @@ class AssistCurveEditorView @JvmOverloads constructor(
         strokeWidth = dp(4f)
         strokeCap = Paint.Cap.ROUND
     }
-    private val phaseSliderActivePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = totalCurveColor
+    private val phaseComfortPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(47, 133, 90)
         style = Paint.Style.STROKE
-        strokeWidth = dp(4f)
+        strokeWidth = dp(5f)
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val phaseSpecialPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(194, 65, 65)
+        style = Paint.Style.STROKE
+        strokeWidth = dp(5f)
         strokeCap = Paint.Cap.ROUND
     }
     private val extensionSliderActivePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -185,7 +200,7 @@ class AssistCurveEditorView @JvmOverloads constructor(
     init {
         isClickable = true
         isFocusable = true
-        minimumHeight = dp(340f).roundToInt()
+        minimumHeight = dp(400f).roundToInt()
     }
 
     fun setParams(newParams: AssistCurveParams) {
@@ -200,7 +215,7 @@ class AssistCurveEditorView @JvmOverloads constructor(
     fun getParams(): AssistCurveParams = params
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val desiredHeight = dp(340f).roundToInt() + paddingTop + paddingBottom
+        val desiredHeight = dp(400f).roundToInt() + paddingTop + paddingBottom
         val resolvedHeight = resolveSize(desiredHeight, heightMeasureSpec)
         super.onMeasure(widthMeasureSpec, MeasureSpec.makeMeasureSpec(resolvedHeight, MeasureSpec.EXACTLY))
     }
@@ -239,7 +254,6 @@ class AssistCurveEditorView @JvmOverloads constructor(
         drawPhaseAxisLabels(canvas, geometry, axisHalfRange)
         drawTorqueSliders(canvas, geometry)
         drawPhaseBiasSlider(canvas, geometry)
-        drawHandles(canvas, geometry, axisHalfRange)
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -302,16 +316,28 @@ class AssistCurveEditorView @JvmOverloads constructor(
             width - paddingRight - dp(10f),
             height - paddingBottom - dp(12f)
         )
-        val graphLeft = outer.left + dp(64f)
-        val graphTop = outer.top + dp(16f)
-        val graphRight = outer.right - dp(12f)
-        val graphBottom = outer.bottom - dp(78f)
+        val horizontalInset = dp(36f)
+        val graphLeft = outer.left + horizontalInset
+        val graphRight = outer.right - horizontalInset
+        val extensionSliderY = outer.top + dp(30f)
+        val phaseOvalBottom = outer.bottom - dp(10f)
+        val phaseOvalTop = phaseOvalBottom - dp(58f)
+        val flexionSliderY = phaseOvalTop - dp(34f)
+        val graphTop = outer.top + dp(66f)
+        val graphBottom = flexionSliderY - dp(50f)
+        val phaseOvalRect = RectF(
+            graphLeft + dp(18f),
+            phaseOvalTop,
+            graphRight - dp(18f),
+            phaseOvalBottom
+        )
         val graphRect = RectF(graphLeft, graphTop, graphRight, graphBottom)
         return Geometry(
             graphRect = graphRect,
             zeroY = (graphTop + graphBottom) * 0.5f,
-            torqueSliderX = graphLeft - dp(28f),
-            phaseSliderY = graphBottom + dp(46f)
+            extensionSliderY = extensionSliderY,
+            flexionSliderY = flexionSliderY,
+            phaseOvalRect = phaseOvalRect
         )
     }
 
@@ -378,68 +404,75 @@ class AssistCurveEditorView @JvmOverloads constructor(
             canvas.drawText(phasePercent.toString(), x, labelY, axisTextPaint)
         }
         canvas.drawText("0", graph.left - dp(16f), geometry.zeroY + dp(4f), axisTextPaint)
-        smallLabelPaint.textAlign = Paint.Align.RIGHT
+        smallLabelPaint.textAlign = Paint.Align.LEFT
         canvas.drawText(
             "+${formatNumber(axisHalfRange, 1)}",
-            graph.right - dp(2f),
-            graph.top - dp(4f),
+            graph.right + dp(6f),
+            graph.top + dp(12f),
             smallLabelPaint
         )
         canvas.drawText(
             "-${formatNumber(axisHalfRange, 1)}",
-            graph.right - dp(2f),
-            graph.bottom + dp(12f),
+            graph.right + dp(6f),
+            graph.bottom - dp(4f),
             smallLabelPaint
         )
         smallLabelPaint.textAlign = Paint.Align.LEFT
     }
 
     private fun drawTorqueSliders(canvas: Canvas, geometry: Geometry) {
-        val x = geometry.torqueSliderX
-        val zeroY = geometry.zeroY
         val graph = geometry.graphRect
-        canvas.drawLine(x, graph.top, x, zeroY, sliderTrackPaint)
-        canvas.drawLine(x, zeroY, x, graph.bottom, sliderTrackPaint)
+        val startX = graph.left
+        val endX = graph.right
+        val extY = geometry.extensionSliderY
+        val flexY = geometry.flexionSliderY
+        val extHandleX = extensionTorqueHandleX(geometry)
+        val flexHandleX = flexionTorqueHandleX(geometry)
 
-        val extHandleY = extensionTorqueHandleY(geometry)
-        val flexHandleY = flexionTorqueHandleY(geometry)
-        canvas.drawLine(x, zeroY, x, extHandleY, extensionSliderActivePaint)
-        canvas.drawLine(x, zeroY, x, flexHandleY, flexionSliderActivePaint)
-
+        canvas.drawLine(startX, flexY, endX, flexY, sliderTrackPaint)
+        canvas.drawLine(startX, flexY, flexHandleX, flexY, flexionSliderActivePaint)
         drawSliderHandle(
             canvas = canvas,
-            x = x,
-            y = extHandleY,
-            color = extensionCurveColor,
-            active = activeTarget == DragTarget.EXT_TMAX
-        )
-        drawSliderHandle(
-            canvas = canvas,
-            x = x,
-            y = flexHandleY,
+            x = flexHandleX,
+            y = flexY,
             color = flexionCurveColor,
             active = activeTarget == DragTarget.FLEX_TMAX
         )
 
-        smallLabelPaint.textAlign = Paint.Align.CENTER
-        canvas.drawText("伸", x, graph.top - dp(6f), smallLabelPaint)
-        canvas.drawText("屈", x, graph.bottom + dp(26f), smallLabelPaint)
-        canvas.drawText(formatNumber(params.extTmax, 1), x - dp(20f), extHandleY + dp(4f), smallLabelPaint)
-        canvas.drawText(formatNumber(params.flexTmax, 1), x - dp(20f), flexHandleY + dp(4f), smallLabelPaint)
+        canvas.drawLine(startX, extY, endX, extY, sliderTrackPaint)
+        canvas.drawLine(startX, extY, extHandleX, extY, extensionSliderActivePaint)
+        drawSliderHandle(
+            canvas = canvas,
+            x = extHandleX,
+            y = extY,
+            color = extensionCurveColor,
+            active = activeTarget == DragTarget.EXT_TMAX
+        )
+
+        smallLabelPaint.textAlign = Paint.Align.LEFT
+        canvas.drawText(
+            "压腿助力 ${formatNumber(params.flexTmax, 1)} Nm",
+            startX,
+            flexY - dp(12f),
+            smallLabelPaint
+        )
+        canvas.drawText(
+            "抬腿助力 ${formatNumber(params.extTmax, 1)} Nm",
+            startX,
+            extY - dp(12f),
+            smallLabelPaint
+        )
         smallLabelPaint.textAlign = Paint.Align.LEFT
     }
 
     private fun drawPhaseBiasSlider(canvas: Canvas, geometry: Geometry) {
-        val startX = geometry.graphRect.left
-        val endX = geometry.graphRect.right
-        val y = geometry.phaseSliderY
-        val handleX = phaseBiasHandleX(geometry)
-        canvas.drawLine(startX, y, endX, y, sliderTrackPaint)
-        canvas.drawLine(startX, y, handleX, y, phaseSliderActivePaint)
+        val oval = geometry.phaseOvalRect
+        val handlePoint = phaseBiasHandlePoint(geometry)
+        drawPhaseBiasZones(canvas, oval)
         drawSliderHandle(
             canvas = canvas,
-            x = handleX,
-            y = y,
+            x = handlePoint.first,
+            y = handlePoint.second,
             color = totalCurveColor,
             active = activeTarget == DragTarget.PHASE_BIAS
         )
@@ -447,18 +480,33 @@ class AssistCurveEditorView @JvmOverloads constructor(
         axisTextPaint.textAlign = Paint.Align.LEFT
         canvas.drawText(
             "相位偏置 ${formatNumber(params.phaseBias, 3)}",
-            startX,
-            y - dp(14f),
+            oval.left,
+            oval.top - dp(8f),
             axisTextPaint
         )
-        smallLabelPaint.textAlign = Paint.Align.LEFT
-        canvas.drawText("-1", startX, y + dp(20f), smallLabelPaint)
         smallLabelPaint.textAlign = Paint.Align.CENTER
-        canvas.drawText("0", (startX + endX) * 0.5f, y + dp(20f), smallLabelPaint)
-        smallLabelPaint.textAlign = Paint.Align.RIGHT
-        canvas.drawText("1", endX, y + dp(20f), smallLabelPaint)
+        canvas.drawText("±0.5", oval.centerX(), oval.top - dp(8f), smallLabelPaint)
+        canvas.drawText("0", oval.centerX(), oval.bottom + dp(14f), smallLabelPaint)
         axisTextPaint.textAlign = Paint.Align.CENTER
         smallLabelPaint.textAlign = Paint.Align.LEFT
+    }
+
+    private fun drawPhaseBiasZones(canvas: Canvas, oval: RectF) {
+        canvas.drawOval(oval, phaseSpecialPaint)
+        canvas.drawArc(
+            oval,
+            phaseBiasAngleDegrees(phaseMin),
+            phaseBiasSweepDegrees(phaseMin, phaseComfortLower),
+            false,
+            phaseComfortPaint
+        )
+        canvas.drawArc(
+            oval,
+            phaseBiasAngleDegrees(phaseComfortUpper),
+            phaseBiasSweepDegrees(phaseComfortUpper, phaseMax),
+            false,
+            phaseComfortPaint
+        )
     }
 
     private fun drawHandles(canvas: Canvas, geometry: Geometry, axisHalfRange: Double) {
@@ -476,7 +524,8 @@ class AssistCurveEditorView @JvmOverloads constructor(
                 x = handle.x,
                 y = handle.y,
                 color = handle.color,
-                active = activeTarget == handle.target
+                active = activeTarget == handle.target,
+                enabled = false
             )
         }
     }
@@ -557,29 +606,38 @@ class AssistCurveEditorView @JvmOverloads constructor(
         if (nearestHandle != null) {
             val dx = nearestHandle.x - x
             val dy = nearestHandle.y - y
-            if (dx * dx + dy * dy <= handleTouchRadius * handleTouchRadius) {
+            if (
+                dx * dx + dy * dy <= handleTouchRadius * handleTouchRadius &&
+                !isFixedStageTarget(nearestHandle.target)
+            ) {
                 return nearestHandle.target
             }
         }
 
-        val torqueHitHalfWidth = dp(20f)
-        if (abs(x - geometry.torqueSliderX) <= torqueHitHalfWidth) {
-            if (y in geometry.graphRect.top - torqueHitHalfWidth..geometry.zeroY + torqueHitHalfWidth) {
-                return DragTarget.EXT_TMAX
-            }
-            if (y in geometry.zeroY - torqueHitHalfWidth..geometry.graphRect.bottom + torqueHitHalfWidth) {
+        val sliderHitHalfHeight = dp(22f)
+        if (x in geometry.graphRect.left - dp(12f)..geometry.graphRect.right + dp(12f)) {
+            if (abs(y - geometry.flexionSliderY) <= sliderHitHalfHeight) {
                 return DragTarget.FLEX_TMAX
+            }
+            if (abs(y - geometry.extensionSliderY) <= sliderHitHalfHeight) {
+                return DragTarget.EXT_TMAX
             }
         }
 
-        val phaseHitHalfHeight = dp(20f)
-        if (abs(y - geometry.phaseSliderY) <= phaseHitHalfHeight &&
-            x in geometry.graphRect.left - dp(12f)..geometry.graphRect.right + dp(12f)
-        ) {
+        if (isNearPhaseOval(x, y, geometry)) {
             return DragTarget.PHASE_BIAS
         }
 
         return DragTarget.NONE
+    }
+
+    private fun isFixedStageTarget(target: DragTarget): Boolean {
+        return target == DragTarget.EXT_START ||
+            target == DragTarget.EXT_PEAK ||
+            target == DragTarget.EXT_END ||
+            target == DragTarget.FLEX_START ||
+            target == DragTarget.FLEX_PEAK ||
+            target == DragTarget.FLEX_END
     }
 
     private fun updateTarget(x: Float, y: Float, geometry: Geometry) {
@@ -604,13 +662,13 @@ class AssistCurveEditorView @JvmOverloads constructor(
                 updateEndHandle(start, end, peak, x, geometry)
             }
             DragTarget.EXT_TMAX -> updateParams {
-                it.copy(extTmax = snapTorque(extensionTorqueFromY(y, geometry)))
+                it.copy(extTmax = snapTorque(extensionTorqueFromX(x, geometry)))
             }
             DragTarget.FLEX_TMAX -> updateParams {
-                it.copy(flexTmax = snapTorque(flexionTorqueFromY(y, geometry)))
+                it.copy(flexTmax = snapTorque(flexionTorqueFromX(x, geometry)))
             }
             DragTarget.PHASE_BIAS -> updateParams {
-                it.copy(phaseBias = snapPhaseBias(phaseBiasFromX(x, geometry)))
+                it.copy(phaseBias = snapPhaseBias(phaseBiasFromPoint(x, y, geometry)))
             }
         }
     }
@@ -723,36 +781,98 @@ class AssistCurveEditorView @JvmOverloads constructor(
         invalidate()
     }
 
-    private fun extensionTorqueHandleY(geometry: Geometry): Float {
+    private fun extensionTorqueHandleX(geometry: Geometry): Float {
         val ratio = (params.extTmax / torqueMax).coerceIn(0.0, 1.0).toFloat()
-        return geometry.zeroY - (geometry.zeroY - geometry.graphRect.top) * ratio
+        return geometry.graphRect.left + geometry.graphRect.width() * ratio
     }
 
-    private fun flexionTorqueHandleY(geometry: Geometry): Float {
+    private fun flexionTorqueHandleX(geometry: Geometry): Float {
         val ratio = (params.flexTmax / torqueMax).coerceIn(0.0, 1.0).toFloat()
-        return geometry.zeroY + (geometry.graphRect.bottom - geometry.zeroY) * ratio
+        return geometry.graphRect.left + geometry.graphRect.width() * ratio
     }
 
-    private fun phaseBiasHandleX(geometry: Geometry): Float {
-        val ratio = ((params.phaseBias - phaseMin) / (phaseMax - phaseMin)).coerceIn(0.0, 1.0)
-        return geometry.graphRect.left + geometry.graphRect.width() * ratio.toFloat()
+    private fun phaseBiasHandlePoint(geometry: Geometry): Pair<Float, Float> {
+        val oval = geometry.phaseOvalRect
+        val ratio = phaseBiasPositionRatio(params.phaseBias)
+        val angle = phaseOvalStartAngle + fullCircleRadians * ratio
+        val radiusX = oval.width() * 0.5f
+        val radiusY = oval.height() * 0.5f
+        return Pair(
+            oval.centerX() + radiusX * cos(angle).toFloat(),
+            oval.centerY() + radiusY * sin(angle).toFloat()
+        )
     }
 
-    private fun extensionTorqueFromY(y: Float, geometry: Geometry): Double {
-        val ratio = ((geometry.zeroY - y) / (geometry.zeroY - geometry.graphRect.top))
+    private fun phaseBiasAngleDegrees(value: Double): Float {
+        val angle = phaseOvalStartAngle + fullCircleRadians * phaseBiasPositionRatio(value)
+        return Math.toDegrees(angle).toFloat()
+    }
+
+    private fun phaseBiasSweepDegrees(startValue: Double, endValue: Double): Float {
+        val ratio = (phaseBiasRatio(endValue) - phaseBiasRatio(startValue)).coerceAtLeast(0.0)
+        return (ratio * 360.0).toFloat()
+    }
+
+    private fun extensionTorqueFromX(x: Float, geometry: Geometry): Double {
+        val ratio = ((x - geometry.graphRect.left) / geometry.graphRect.width())
             .coerceIn(0f, 1f)
         return torqueMax * ratio
     }
 
-    private fun flexionTorqueFromY(y: Float, geometry: Geometry): Double {
-        val ratio = ((y - geometry.zeroY) / (geometry.graphRect.bottom - geometry.zeroY))
+    private fun flexionTorqueFromX(x: Float, geometry: Geometry): Double {
+        val ratio = ((x - geometry.graphRect.left) / geometry.graphRect.width())
             .coerceIn(0f, 1f)
         return torqueMax * ratio
     }
 
-    private fun phaseBiasFromX(x: Float, geometry: Geometry): Double {
-        val ratio = ((x - geometry.graphRect.left) / geometry.graphRect.width()).coerceIn(0f, 1f)
+    private fun phaseBiasFromPoint(x: Float, y: Float, geometry: Geometry): Double {
+        val ratio = phaseBiasRatioFromPoint(x, y, geometry)
+        if (ratio <= phaseStep * 0.5 && params.phaseBias > 0.0) {
+            return phaseMax
+        }
         return phaseMin + (phaseMax - phaseMin) * ratio
+    }
+
+    private fun phaseBiasRatio(value: Double): Double {
+        return ((value - phaseMin) / (phaseMax - phaseMin)).coerceIn(0.0, 1.0)
+    }
+
+    private fun phaseBiasPositionRatio(value: Double): Double {
+        val ratio = phaseBiasRatio(value)
+        return if (ratio >= 1.0) 0.0 else ratio
+    }
+
+    private fun phaseBiasRatioFromPoint(x: Float, y: Float, geometry: Geometry): Double {
+        val oval = geometry.phaseOvalRect
+        val radiusX = oval.width() * 0.5f
+        val radiusY = oval.height() * 0.5f
+        if (radiusX <= 0f || radiusY <= 0f) {
+            return 0.0
+        }
+        val scaledX = ((x - oval.centerX()) / radiusX).toDouble()
+        val scaledY = ((y - oval.centerY()) / radiusY).toDouble()
+        var ratio = (atan2(scaledY, scaledX) - phaseOvalStartAngle) / fullCircleRadians
+        while (ratio < 0.0) {
+            ratio += 1.0
+        }
+        while (ratio >= 1.0) {
+            ratio -= 1.0
+        }
+        return ratio
+    }
+
+    private fun isNearPhaseOval(x: Float, y: Float, geometry: Geometry): Boolean {
+        val oval = geometry.phaseOvalRect
+        val radiusX = oval.width() * 0.5f
+        val radiusY = oval.height() * 0.5f
+        if (radiusX <= 0f || radiusY <= 0f) {
+            return false
+        }
+        val scaledX = ((x - oval.centerX()) / radiusX).toDouble()
+        val scaledY = ((y - oval.centerY()) / radiusY).toDouble()
+        val normalizedDistance = sqrt(scaledX * scaledX + scaledY * scaledY)
+        val hitBand = (dp(22f) / min(radiusX, radiusY)).coerceAtLeast(0.32f)
+        return abs(normalizedDistance - 1.0) <= hitBand
     }
 
     private fun displayToBasePhase(x: Float, geometry: Geometry): Double {
@@ -780,16 +900,23 @@ class AssistCurveEditorView @JvmOverloads constructor(
         x: Float,
         y: Float,
         color: Int,
-        active: Boolean
+        active: Boolean,
+        enabled: Boolean = true
     ) {
         val radius = if (active) dp(9f) else dp(7f)
-        if (active) {
+        val strokeColor = if (enabled) color else colorWithAlpha(color, 120)
+        handleFillPaint.alpha = if (enabled) 255 else 170
+        if (active && enabled) {
             handleGlowPaint.color = color
             canvas.drawCircle(x, y, radius + dp(6f), handleGlowPaint)
         }
-        handleStrokePaint.color = color
+        handleStrokePaint.color = strokeColor
         canvas.drawCircle(x, y, radius, handleFillPaint)
         canvas.drawCircle(x, y, radius, handleStrokePaint)
+    }
+
+    private fun colorWithAlpha(color: Int, alpha: Int): Int {
+        return Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
     }
 
     private fun snapPhasePoint(value: Double): Double {

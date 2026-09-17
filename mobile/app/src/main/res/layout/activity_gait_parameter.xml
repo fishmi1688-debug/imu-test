@@ -36,6 +36,7 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
+                android:layout_marginEnd="8dp"
                 android:orientation="vertical">
 
                 <TextView
@@ -46,6 +47,20 @@
                     android:textSize="22sp"
                     android:textStyle="bold" />
             </LinearLayout>
+
+            <Button
+                android:id="@+id/detailParamsButton"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:layout_marginEnd="8dp"
+                android:background="@drawable/bg_header_action_button"
+                android:backgroundTint="@null"
+                android:minWidth="0dp"
+                android:paddingHorizontal="12dp"
+                android:text="@string/gait_detail_params_button"
+                android:textAllCaps="false"
+                android:textColor="@color/white"
+                android:textSize="13sp" />
 
             <LinearLayout
                 android:layout_width="wrap_content"
@@ -319,7 +334,7 @@
             <com.example.mobile.AssistCurveEditorView
                 android:id="@+id/assistCurveEditorView"
                 android:layout_width="match_parent"
-                android:layout_height="360dp"
+                android:layout_height="420dp"
                 android:layout_marginTop="10dp" />
 
             <TextView
@@ -331,6 +346,13 @@
                 android:textColor="@color/text_secondary"
                 android:textSize="13sp" />
         </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/detailParamsContent"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone">
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -1024,8 +1046,10 @@
                     android:textAllCaps="false"
                     android:textSize="20sp"
                     android:text=""
-                    android:importantForAccessibility="no" />
+                android:importantForAccessibility="no" />
             </LinearLayout>
+        </LinearLayout>
+
         </LinearLayout>
 
         <LinearLayout

@@ -49,6 +49,10 @@ object GaitProtocol {
         "downhill",
         "imu_phase",
         "imu_left_phase",
+        "model_phase",
+        "imu_left_ao_phase",
+        "imu_ao_phase",
+        "walking_diff_test",
     )
 
     private val messageTypeCodeToText = mapOf(

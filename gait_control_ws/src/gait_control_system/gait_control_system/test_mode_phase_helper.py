@@ -202,3 +202,91 @@ class TestModePhaseTracker:
             "left_period_sec": float(self.phase_state["left"].get("cycle_period", 0.0) or 0.0),
             "right_period_sec": float(self.phase_state["right"].get("cycle_period", 0.0) or 0.0),
         }
+
+    def update_single_signal(self, angle: float, current_time: float, gait_state: int) -> dict:
+        """用单个角度信号估计左相位，右相位固定为左相位+半周期。"""
+        angle_now = float(angle)
+        if int(gait_state) != 1:
+            self._deactivate_leg_phase("left", angle=angle_now)
+            self._deactivate_leg_phase("right", angle=angle_now)
+            self.left_phase_valid = False
+            self.right_phase_valid = False
+            self.left_assist_ready = False
+            self.right_assist_ready = False
+            return {
+                "left_phase_norm": 0.0,
+                "right_phase_norm": 0.5,
+                "left_phase_rad": 0.0,
+                "right_phase_rad": math.pi,
+                "left_valid": False,
+                "right_valid": False,
+                "left_assist_ready": False,
+                "right_assist_ready": False,
+                "phase_active": False,
+                "left_peak": False,
+                "right_peak": False,
+                "left_period_sec": float(self.phase_state["left"].get("cycle_period", 0.0) or 0.0),
+                "right_period_sec": float(self.phase_state["left"].get("cycle_period", 0.0) or 0.0),
+            }
+
+        left_phase_norm, valid, peak, assist_ready = self._update_leg_phase(
+            "left", angle_now, current_time
+        )
+        right_phase_norm = (float(left_phase_norm) + 0.5) % 1.0
+        self.left_phase_valid = bool(valid)
+        self.right_phase_valid = bool(valid)
+        self.left_assist_ready = bool(assist_ready)
+        self.right_assist_ready = bool(assist_ready)
+        cycle_period = float(self.phase_state["left"].get("cycle_period", 0.0) or 0.0)
+        return {
+            "left_phase_norm": float(left_phase_norm),
+            "right_phase_norm": float(right_phase_norm),
+            "left_phase_rad": float(left_phase_norm) * (2.0 * math.pi),
+            "right_phase_rad": float(right_phase_norm) * (2.0 * math.pi),
+            "left_valid": self.left_phase_valid,
+            "right_valid": self.right_phase_valid,
+            "left_assist_ready": self.left_assist_ready,
+            "right_assist_ready": self.right_assist_ready,
+            "phase_active": bool(gait_state == 1 and valid),
+            "left_peak": bool(peak),
+            "right_peak": False,
+            "left_period_sec": cycle_period,
+            "right_period_sec": cycle_period,
+        }
+
+    def seed_single_signal_phase(
+        self,
+        angle: float,
+        current_time: float,
+        phase_norm: float,
+        estimated_human_frequency: float = 1.0,
+        assist_ready: bool = False,
+    ) -> None:
+        """给单信号相位模式设置一个起始相位，用于停止->运动第一步。"""
+        phase = float(phase_norm) % 1.0
+        cycle_period = self._default_cycle_period(estimated_human_frequency)
+        cycle_start_time = float(current_time) - phase * cycle_period
+        angle_now = float(angle)
+
+        left_state = self.phase_state["left"]
+        left_state["last_angle"] = angle_now
+        left_state["last_slope"] = 0.0
+        left_state["last_peak_time"] = None
+        left_state["cycle_start_time"] = cycle_start_time
+        left_state["cycle_period"] = cycle_period
+        left_state["assist_ready"] = bool(assist_ready)
+        left_state["trend"] = "unknown"
+
+        right_state = self.phase_state["right"]
+        right_state["last_angle"] = angle_now
+        right_state["last_slope"] = 0.0
+        right_state["last_peak_time"] = None
+        right_state["cycle_start_time"] = cycle_start_time
+        right_state["cycle_period"] = cycle_period
+        right_state["assist_ready"] = bool(assist_ready)
+        right_state["trend"] = "unknown"
+
+        self.left_phase_valid = True
+        self.right_phase_valid = True
+        self.left_assist_ready = bool(assist_ready)
+        self.right_assist_ready = bool(assist_ready)

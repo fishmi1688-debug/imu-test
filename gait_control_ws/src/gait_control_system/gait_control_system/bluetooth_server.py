@@ -126,6 +126,10 @@ MODE_KEYS = [
     "downhill",
     "imu_phase",
     "imu_left_phase",
+    "model_phase",
+    "imu_left_ao_phase",
+    "imu_ao_phase",
+    "walking_diff_test",
 ]
 
 
@@ -776,6 +780,9 @@ class BluetoothBleNotifyServer:
         return True
 
     def _run(self) -> None:
+        if os.environ.get("GAIT_BT_SETUP_IN_SERVER", "1") != "0":
+            setup_bluetooth_adapter(self._service_name)
+
         adapter_addr = _normalize_bind_addr(self._bind_addr_raw, self._log_warn)
         if not adapter_addr:
             self._log_error("❌ 无法定位本机蓝牙适配器，BLE 服务无法启动")
@@ -1000,7 +1007,7 @@ def build_state_frame(settings: StreamSettings, seq: int) -> bytes:
         flags |= 1 << bit
     if (seq // max(1, settings.batch_size)) % 4 in (1, 2):
         flags |= 1 << FLAG_ASSIST_OUTPUT_ACTIVE
-    if settings.mode_code in (3, 4):
+    if settings.mode_code in (3, 4, 13):
         flags |= 1 << FLAG_TEST_LEFT_PHASE_VALID
         flags |= 1 << FLAG_TEST_RIGHT_PHASE_VALID
         flags |= 1 << FLAG_TEST_LEFT_ASSIST_READY

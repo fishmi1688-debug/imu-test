@@ -1,7 +1,6 @@
 from collections import deque
 
 import numpy as np
-from scipy import signal as sp_signal
 
 
 class AdaptiveOscillatorEstimator:
@@ -26,9 +25,13 @@ class AdaptiveOscillatorEstimator:
         self.filter_enabled = bool(self.config.get("FILTER_ENABLED", False))
         self.sos = None
         self.sos_state = None
+        self.sp_signal = None
         if not self.filter_enabled:
             return
         try:
+            from scipy import signal as sp_signal
+
+            self.sp_signal = sp_signal
             cutoff = float(self.config.get("FILTER_CUTOFF", 0.3))
             fs = 1.0 / max(self.dt, 1e-6)
             self.sos = sp_signal.butter(2, cutoff, "hp", fs=fs, output="sos")
@@ -38,6 +41,7 @@ class AdaptiveOscillatorEstimator:
             self.filter_enabled = False
             self.sos = None
             self.sos_state = None
+            self.sp_signal = None
 
     def _reset_state(self):
         size = self.harmonic_order + 1
@@ -99,9 +103,9 @@ class AdaptiveOscillatorEstimator:
 
     def _filter(self, sample):
         sample = float(sample)
-        if self.filter_enabled and self.sos is not None:
+        if self.filter_enabled and self.sos is not None and self.sp_signal is not None:
             try:
-                filtered, self.sos_state = sp_signal.sosfilt(
+                filtered, self.sos_state = self.sp_signal.sosfilt(
                     self.sos, [sample], zi=self.sos_state
                 )
                 return float(filtered[0])
@@ -189,14 +193,21 @@ class AdaptiveOscillatorEstimator:
                 )
         return True
 
-    def step(self, raw_sample):
-        """Process one sample and return RAO gait phase in [0, 2pi)."""
+    def step(self, raw_sample, raw_derivative=None):
+        """Process one sample and return RAO gait phase in [0, 2pi).
+
+        raw_derivative is optional to keep the original encoder-angle path
+        unchanged; IMU paths can pass gyro-derived angular velocity directly.
+        """
         q = self._filter(raw_sample)
         dt = max(self.dt, 1e-6)
         t_now = self.time_now + dt
 
         prev_q = self.prev_q
-        dq = 0.0 if prev_q is None else (q - prev_q) / dt
+        if raw_derivative is None:
+            dq = 0.0 if prev_q is None else (q - prev_q) / dt
+        else:
+            dq = float(raw_derivative)
         zero_cross = self._detect_zero_cross(prev_q, q, dq, t_now)
 
         sin_phi = np.sin(self.phi)

@@ -16,6 +16,7 @@ if GAIT_SRC not in sys.path:
     sys.path.insert(0, GAIT_SRC)
 
 from gait_control_system.bluetooth_server import (  # noqa: E402
+    MODE_KEYS,
     StreamSettings,
     build_default_server,
     build_plot_frame_batch,
@@ -139,7 +140,7 @@ def main() -> int:
                 )
 
             if msg_type == 3 and isinstance(payload, dict):
-                state.mode_code = max(0, min(7, int(payload.get("m", 0))))
+                state.mode_code = max(0, min(len(MODE_KEYS) - 1, int(payload.get("m", 0))))
                 push_state(server)
                 return json.dumps(
                     {"t": 11, "o": 1, "a": 4, "m": state.mode_code},

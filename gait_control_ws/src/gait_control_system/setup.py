@@ -8,6 +8,9 @@ setup(
     name=package_name,
     version='1.0.0',
     packages=[package_name],
+    package_data={
+        package_name: ['model/*.onnx', 'model/*.pkl', 'model/*.keras', 'model/*.joblib'],
+    },
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -18,6 +21,7 @@ setup(
     install_requires=[
         'setuptools',
         'bleak>=0.22.1',
+        'joblib',
     ],
     zip_safe=True,
     maintainer='gait_control_lab',

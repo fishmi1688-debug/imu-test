@@ -19,11 +19,8 @@ import rclpy
 from rclpy.parameter import Parameter
 from std_msgs.msg import String as RosString
 
-from .bluetooth_server import build_default_server
 from .can_utils import cleanup_can_interface, setup_can_interface
-from .adaptive_oscillator_estimator import AdaptiveOscillatorEstimator
 from .gait_constants import (
-    AO_CONFIG,
     CAN_INTERFACE,
     LEFT_MOTOR_ID,
     RIGHT_MOTOR_ID,
@@ -35,6 +32,8 @@ from .real_time_gait_analysis import (
     SINGLE_IMU_PHASE_MODES,
     STAIRS_DOWN_MANUAL_MODES,
 )
+
+_MODULE_IMPORT_DONE_WALL_TS = time.time()
 
 
 def _is_can_interface_up(interface: str = CAN_INTERFACE) -> bool:
@@ -99,10 +98,50 @@ def _wait_for_dual_motor_feedback(
     return left_ready and right_ready
 
 
+def _read_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+def _clamp_float(value: float, low: float, high: float) -> float:
+    return max(low, min(high, float(value)))
+
+
 def main():
     """主函数 - 自动启动关节助力系统"""
+    startup_start_mono = time.monotonic()
+    startup_last_mono = startup_start_mono
+
+    def _startup_mark(label: str) -> None:
+        nonlocal startup_last_mono
+        now_mono = time.monotonic()
+        print(
+            f"⏱️ 启动耗时 {label}: "
+            f"+{now_mono - startup_last_mono:.3f}s, total={now_mono - startup_start_mono:.3f}s",
+            flush=True,
+        )
+        startup_last_mono = now_mono
+
     print("🚀 启动关节助力系统...")
     print("💪 系统将自动提供关节助力，无需手动选择")
+    launch_wall_raw = os.environ.get("GAIT_MAIN_LAUNCH_WALL_TS", "").strip()
+    if launch_wall_raw:
+        try:
+            import_gap = _MODULE_IMPORT_DONE_WALL_TS - float(launch_wall_raw)
+            if import_gap >= 0.0:
+                print(f"⏱️ Python解释器+模块导入: {import_gap:.3f}s", flush=True)
+        except Exception:
+            pass
+    boot_default_mode = (
+        os.environ.get("GAIT_BOOT_DEFAULT_MODE", "imu_phase").strip()
+        or "imu_phase"
+    )
+    boot_auto_start_enabled = (
+        os.environ.get("GAIT_BOOT_AUTO_START", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
     
     # 检查是否启用调试模式（通过环境变量）
     debug_mode = os.environ.get('GAIT_DEBUG', '0') == '1'
@@ -114,42 +153,54 @@ def main():
     
     # 初始化CAN硬件
     setup_can_interface()
+    _startup_mark("setup_can_interface")
     can_ready_timeout = float(os.environ.get("GAIT_CAN_READY_TIMEOUT", "3.0"))
     if _wait_for_can_interface_up(interface=CAN_INTERFACE, timeout_sec=can_ready_timeout):
         print("✅ CAN接口就绪，继续启动")
     else:
         print("⚠️ CAN接口就绪检测超时，继续启动并由后续通信逻辑兜底")
+    _startup_mark("CAN就绪确认")
     
     # 注册退出处理
     signal.signal(signal.SIGINT, lambda s, f: cleanup_can_interface())
     
     # ROS2节点初始化，传入调试模式参数
     rclpy.init()
+    _startup_mark("rclpy.init")
     gait_analysis = RealTimeGaitAnalysis(debug_mode=debug_mode)
+    _startup_mark("RealTimeGaitAnalysis")
     motor_controller = MotorController(gait_analysis_ref=gait_analysis, debug_mode=debug_mode)
+    _startup_mark("MotorController")
     
     # 设置互相引用
     gait_analysis.motor_controller_ref = motor_controller
     
     # 初始化数据记录系统
     gait_analysis.init_data_logging()
+    _startup_mark("数据日志初始化")
 
     try:
         motor_controller.get_logger().info(
-            "🚀 CAN节点已初始化，等待APP点击开始后再使能电机并检查50Hz反馈"
+            "🚀 CAN节点已初始化，默认开机自动进入有线IMU相位模式并启动助力"
         )
         
-        # 设置默认运动模式为步行
-        gait_analysis.set_motion_mode('walking')
-        motor_controller.get_logger().info("🚶 默认运动模式设置为: 步行模式")
+        # 设置默认运动模式为有线IMU相位模式，稍后在本进程内自动完成启动流程。
+        if not gait_analysis.set_motion_mode(boot_default_mode):
+            motor_controller.get_logger().warn(
+                f"⚠️ 默认运动模式无效: {boot_default_mode}，回退到 imu_phase"
+            )
+            boot_default_mode = "imu_phase"
+            gait_analysis.set_motion_mode(boot_default_mode)
+        motor_controller.get_logger().info(f"🦵 默认运动模式设置为: {boot_default_mode}")
+        _startup_mark("默认模式设置")
         
         print("\n🦾 关节助力系统已启动")
         print("="*50)
         print("⚠️ 重要提示:")
         print("   1. 当前按 RS01 私有运控 CAN 协议通信")
         print("   2. 左电机 CAN ID=1，右电机 CAN ID=2")
-        print("   3. APP 点击“开始传输并启动系统”后才会重新使能电机、执行标零并检查反馈")
-        print("   4. 普通模式电机状态帧采用 RS01 50Hz 主动上报；IMU相位模式不启用电机主动上报")
+        print("   3. 开机默认有线IMU相位模式会自动启动助力，不等待手机连接")
+        print("   4. 手机切换模式后助力会先停止，需由APP重新点击开始/手动助力")
         print("")
         print("📱 APP蓝牙控制命令示例:")
         print('   - 切换模式: {"t":3,"m":0}')
@@ -168,7 +219,16 @@ def main():
     max_retries = 5
     last_left_motor_torque = 0.0
     last_right_motor_torque = 0.0
-    torque_filter_alpha = 0.3  # 电机目标力矩平滑系数
+    last_torque_filter_time = 0.0
+    torque_filter_alpha = _clamp_float(
+        _read_env_float("GAIT_TORQUE_FILTER_ALPHA", 0.3),
+        0.0,
+        1.0,
+    )  # 电机目标力矩平滑系数
+    torque_slew_rate_nm_s = max(
+        0.0,
+        _read_env_float("GAIT_TORQUE_SLEW_RATE_NM_S", 60.0),
+    )  # 0 表示关闭斜率限制
     last_state_signature = None
     last_state_send_time = 0.0
     last_imu_status_signature = None
@@ -235,6 +295,13 @@ def main():
     except Exception:
         imu_phase_rate_check_sec = 2.0
     try:
+        boot_imu_phase_rate_check_sec = max(
+            0.2,
+            float(os.environ.get("GAIT_BOOT_IMU_PHASE_RATE_CHECK_SEC", "0.3")),
+        )
+    except Exception:
+        boot_imu_phase_rate_check_sec = 0.3
+    try:
         imu_stale_restart_interval_sec = max(
             0.0,
             float(os.environ.get("GAIT_IMU_PHASE_STALE_RESTART_SEC", "2.0")),
@@ -270,6 +337,10 @@ def main():
         "downhill",
         "imu_phase",
         "imu_left_phase",
+        "model_phase",
+        "imu_left_ao_phase",
+        "imu_ao_phase",
+        "walking_diff_test",
     )
     bt_state_mode_to_code = {mode_key: idx for idx, mode_key in enumerate(bt_state_mode_order)}
     bt_msg_type_to_code = {
@@ -416,7 +487,7 @@ def main():
                 "imu_phase_left": phase_left_keep,
                 "imu_phase_right": phase_right_keep,
             }
-        if mode in ("stairs_down", "test", "walking_test"):
+        if mode in ("stairs_down", "test", "walking_test", "walking_diff_test"):
             return {
                 "walking": False,
                 "cycling": False,
@@ -521,6 +592,9 @@ def main():
 
     def _preconnect_imu_phase_slots_before_bluetooth() -> None:
         phase_uses_wired = bool(getattr(gait_analysis, "imu_phase_is_wired", False))
+        if app_runtime_enabled:
+            motor_controller.get_logger().info("📡 开机自动启动已运行，跳过APP BLE前IMU预连接流程")
+            return
         if not _env_enabled("GAIT_IMU_PHASE_PRECONNECT", False):
             return
 
@@ -547,8 +621,9 @@ def main():
         request_slots = ("imu_phase_left",) if preconnect_left_only else slots
         required_slots = ("imu_phase_left",) if preconnect_left_only else slots
         if phase_uses_wired:
+            source_label = str(getattr(gait_analysis, "imu_phase_source_label", "有线IMU"))
             motor_controller.get_logger().info(
-                "📡 启动APP BLE服务前预连接有线CAN相位IMU"
+                f"📡 启动APP BLE服务前预连接{source_label}相位源"
             )
         elif preconnect_left_only:
             motor_controller.get_logger().info(
@@ -687,6 +762,44 @@ def main():
         motor_controller.get_logger().warn("❌ IMU相位模式发送50Hz助力帧失败")
         return False
 
+    def _send_zero_torque_now(reason: str = "") -> None:
+        left_ok = bool(motor_controller.send_mit_torque_command(LEFT_MOTOR_ID, 0.0))
+        right_ok = bool(motor_controller.send_mit_torque_command(RIGHT_MOTOR_ID, 0.0))
+        if reason:
+            motor_controller.get_logger().info(
+                f"🛑 已发送零力矩停止助力: {reason}, left_ok={left_ok}, right_ok={right_ok}"
+            )
+
+    def _stop_runtime_assist(reason: str, *, send_zero: bool = True) -> None:
+        nonlocal app_runtime_enabled
+        nonlocal last_left_motor_torque
+        nonlocal last_right_motor_torque
+        nonlocal last_imu_motor_command_time
+        nonlocal last_torque_filter_time
+        nonlocal last_torque_filter_time
+        app_runtime_enabled = False
+        last_left_motor_torque = 0.0
+        last_right_motor_torque = 0.0
+        last_imu_motor_command_time = 0.0
+        last_torque_filter_time = 0.0
+        gait_analysis.assist_enable = False
+        gait_analysis.assist_wait_next_zero = False
+        gait_analysis.assist_output_active = False
+        gait_analysis.actual_left_torque = 0.0
+        gait_analysis.actual_right_torque = 0.0
+        gait_analysis.gait_state = 0
+        if str(getattr(gait_analysis, "current_motion_mode", "walking")) in STAIRS_DOWN_MANUAL_MODES:
+            try:
+                gait_analysis.set_stairs_down_manual_assist(enabled=False)
+            except Exception:
+                pass
+        try:
+            gait_analysis.reset_phase_estimator()
+        except Exception:
+            pass
+        if send_zero:
+            _send_zero_torque_now(reason)
+
     def _request_imu_phase_measurement_restart_if_due(side: str, detector, now: float) -> None:
         if imu_stale_restart_interval_sec <= 0.0 or detector is None:
             return
@@ -737,13 +850,19 @@ def main():
             if slot_name not in rates:
                 parts.append(f"{labels.get(slot_name, slot_name)}无数据")
         rate_text = "，".join(parts) if parts else "未收到IMU数据"
+        source_hint = str(
+            getattr(gait_analysis, "imu_phase_source_check_hint", "请检查IMU设备连接")
+        )
         return (
             f"有线IMU频率检查失败：目标{imu_phase_rate_expected_hz:.0f}Hz，"
             f"最低要求{imu_phase_rate_min_hz:.0f}Hz，当前{rate_text}。"
-            "请检查IMU设备供电、CAN连接、终端电阻、can0状态和帧ID配置。"
+            f"{source_hint}。"
         )
 
-    def _check_wired_imu_phase_rate_before_start(mode: str) -> tuple[bool, str, str]:
+    def _check_wired_imu_phase_rate_before_start(
+        mode: str,
+        check_sec: float | None = None,
+    ) -> tuple[bool, str, str]:
         """Check wired IMU complete-sample rate before enabling motors."""
         if mode not in IMU_PHASE_MODES or not bool(getattr(gait_analysis, "imu_phase_is_wired", False)):
             return True, "", ""
@@ -751,6 +870,11 @@ def main():
         required_slots = _required_imu_phase_slots_for_mode(mode)
         if not required_slots:
             return True, "", ""
+        effective_check_sec = (
+            imu_phase_rate_check_sec
+            if check_sec is None
+            else max(0.2, float(check_sec))
+        )
 
         for slot_name in required_slots:
             result = gait_analysis.control_imu_connection(
@@ -762,14 +886,14 @@ def main():
                 detail = (
                     f"有线IMU打开失败：{slot_name}，"
                     f"reason={str(result.get('reason', 'unknown'))}。"
-                    "请检查CAN接口和IMU设备。"
+                    f"{getattr(gait_analysis, 'imu_phase_source_check_hint', '请检查IMU设备连接')}。"
                 )
                 return False, "imu_rate_check_failed", detail
 
         motor_controller.get_logger().info(
             "🧪 开始有线IMU 50Hz频率检查: "
             f"mode={mode}, slots={','.join(required_slots)}, "
-            f"window={imu_phase_rate_check_sec:.1f}s, "
+            f"window={effective_check_sec:.1f}s, "
             f"min={imu_phase_rate_min_hz:.1f}Hz"
         )
 
@@ -778,7 +902,7 @@ def main():
         last_seq: dict[str, int] = {}
         last_time: dict[str, float] = {}
         check_start = time.time()
-        deadline = check_start + imu_phase_rate_check_sec + 1.5
+        deadline = check_start + effective_check_sec + 1.5
 
         while time.time() < deadline:
             now = time.time()
@@ -802,7 +926,7 @@ def main():
                 last_seq[slot_name] = seq_int
                 last_time[slot_name] = float(sample_time)
 
-            if now - check_start >= imu_phase_rate_check_sec:
+            if now - check_start >= effective_check_sec:
                 break
             time.sleep(0.01)
 
@@ -825,7 +949,10 @@ def main():
             rate_text = ", ".join(
                 f"{slot_name}={rate:.1f}Hz" for slot_name, rate in rates.items()
             )
-            motor_controller.get_logger().info(f"✅ 有线IMU频率检查通过: {rate_text}")
+            motor_controller.get_logger().info(
+                f"✅ 有线IMU频率检查通过: {rate_text}, "
+                f"耗时={time.time() - check_start:.3f}s"
+            )
             return True, "", ""
 
         detail = _format_imu_phase_rate_detail(rates, missing)
@@ -841,6 +968,101 @@ def main():
         gait_analysis.actual_left_torque = 0.0
         gait_analysis.actual_right_torque = 0.0
         return False, "imu_rate_check_failed", detail
+
+    def _run_boot_auto_start() -> None:
+        nonlocal app_runtime_enabled
+        nonlocal last_left_motor_torque
+        nonlocal last_right_motor_torque
+        nonlocal last_imu_motor_command_time
+        if not boot_auto_start_enabled:
+            motor_controller.get_logger().info("⏸️ 开机自动启动已关闭 (GAIT_BOOT_AUTO_START=0)")
+            return
+
+        current_mode = str(getattr(gait_analysis, "current_motion_mode", boot_default_mode))
+        motor_controller.get_logger().info(
+            f"🚀 开机自动启动流程开始: mode={current_mode}"
+        )
+        _sync_imu_measurement_for_mode(force=True)
+
+        if current_mode in IMU_PHASE_MODES:
+            last_left_motor_torque = 0.0
+            last_right_motor_torque = 0.0
+            last_imu_motor_command_time = 0.0
+            last_torque_filter_time = 0.0
+            rate_ok, rate_reason, rate_detail = _check_wired_imu_phase_rate_before_start(
+                current_mode,
+                check_sec=boot_imu_phase_rate_check_sec,
+            )
+            if not rate_ok:
+                _stop_runtime_assist(
+                    f"开机自动启动失败: {rate_reason or 'imu_rate_check_failed'}",
+                    send_zero=True,
+                )
+                motor_controller.get_logger().warn(
+                    f"⚠️ 开机自动启动取消: {rate_detail}"
+                )
+                return
+
+        motor_active_report = current_mode not in IMU_PHASE_MODES
+        if not motor_active_report:
+            _sync_motor_active_report_for_mode(force=True)
+
+        left_ok = bool(
+            motor_controller.enable_motor(
+                LEFT_MOTOR_ID,
+                active_report=motor_active_report,
+            )
+        )
+        right_ok = bool(
+            motor_controller.enable_motor(
+                RIGHT_MOTOR_ID,
+                active_report=motor_active_report,
+            )
+        )
+        zero_ok = bool(left_ok and right_ok and motor_controller.execute_mechanical_zero())
+        feedback_ok = True
+        reason = ""
+        if not left_ok or not right_ok:
+            reason = "motor_enable_failed"
+        elif not zero_ok:
+            reason = "mechanical_zero_failed"
+        elif motor_active_report:
+            feedback_ok = bool(
+                _wait_for_dual_motor_feedback(
+                    motor_controller,
+                    timeout_sec=1.0,
+                    poll_interval_sec=0.02,
+                )
+            )
+            if not feedback_ok:
+                reason = "motor_feedback_timeout"
+
+        enabled = bool(getattr(gait_analysis, "assist_enable", False))
+        if not reason and current_mode in STAIRS_DOWN_MANUAL_MODES:
+            result = gait_analysis.set_stairs_down_manual_assist(enabled=True)
+            current_mode = str(result.get("mode", current_mode))
+            enabled = bool(result.get("enabled", False))
+            if not bool(result.get("ok", False)):
+                reason = str(result.get("reason", "")) or "manual_prepare_failed"
+        else:
+            enabled = bool(getattr(gait_analysis, "assist_enable", False))
+
+        ok = not reason
+        app_runtime_enabled = ok
+        if not ok:
+            _stop_runtime_assist(
+                f"开机自动启动失败: {reason}",
+                send_zero=True,
+            )
+        motor_controller.get_logger().info(
+            "🚀 开机自动启动完成: "
+            f"mode={current_mode}, motor_active_report={motor_active_report}, "
+            f"feedback_ok={feedback_ok}, enabled={enabled}, "
+            f"run_enabled={app_runtime_enabled}, ok={ok}, reason={reason or '-'}"
+        )
+
+    _run_boot_auto_start()
+    _startup_mark("开机自动启动流程")
 
     bluetooth_server = None
     bt_enabled = os.environ.get("GAIT_BT_ENABLE", "1") != "0"
@@ -1310,7 +1532,7 @@ def main():
             )
 
         def _is_test_peak_mode(mode_key: str) -> bool:
-            return mode_key in ("test", "walking_test")
+            return mode_key in ("test", "walking_test", "walking_diff_test")
 
         def _select_plot_phase_and_assist(
             phase_left: float,
@@ -1322,7 +1544,7 @@ def main():
             if not _is_test_peak_mode(current_mode):
                 return float(phase_left), float(assist_left)
 
-            # test/walking_test 的实时绘图相位固定使用左腿相位，
+            # 电机峰值测试模式的实时绘图相位固定使用左腿相位，
             # 同时固定绘制左腿助力，避免左右腿混用导致图形跳变。
             return float(phase_left), float(assist_left)
 
@@ -1572,6 +1794,7 @@ def main():
             nonlocal last_left_motor_torque
             nonlocal last_right_motor_torque
             nonlocal last_imu_motor_command_time
+            nonlocal last_torque_filter_time
             nonlocal last_bt_ping_log_time
             payload = None
             text = line.strip()
@@ -1725,6 +1948,10 @@ def main():
                 ok = gait_analysis.set_motion_mode(mode)
                 applied_mode = str(getattr(gait_analysis, "current_motion_mode", mode))
                 if ok:
+                    _stop_runtime_assist(
+                        f"APP切换模式: {mode} -> {applied_mode}",
+                        send_zero=True,
+                    )
                     _sync_imu_measurement_for_mode(force=True)
                     _sync_motor_active_report_for_mode(force=True)
                 applied_mode_code = bt_state_mode_to_code.get(applied_mode, -1)
@@ -1924,6 +2151,7 @@ def main():
                         last_left_motor_torque = 0.0
                         last_right_motor_torque = 0.0
                         last_imu_motor_command_time = 0.0
+                        last_torque_filter_time = 0.0
                         rate_ok, rate_reason, rate_detail = _check_wired_imu_phase_rate_before_start(
                             current_mode
                         )
@@ -2075,6 +2303,32 @@ def main():
                             desired = int(value) != 0
                         except Exception:
                             desired = bool(value)
+                    current_manual_enabled = bool(
+                        getattr(gait_analysis, "stairs_down_manual_assist_enabled", False)
+                    )
+                    target_enabled = (
+                        not current_manual_enabled if desired is None else bool(desired)
+                    )
+                    if target_enabled and not app_runtime_enabled:
+                        resolved_mode = str(
+                            getattr(gait_analysis, "current_motion_mode", "walking")
+                        )
+                        resolved_mode_code = bt_state_mode_to_code.get(resolved_mode, -1)
+                        reason = "manual_prepare_failed"
+                        motor_controller.get_logger().warn(
+                            "📱 APP操作: command stairs_down_toggle blocked, "
+                            "请先点击开始传输并启动系统"
+                        )
+                        return _json_response(
+                            {
+                                "t": bt_msg_type_to_code["ack"],
+                                "o": 0,
+                                "a": 2,
+                                "e": 1 if current_manual_enabled else 0,
+                                "m": resolved_mode_code,
+                                "r": _reason_to_code(reason),
+                            }
+                        )
                     result = gait_analysis.set_stairs_down_manual_assist(enabled=desired)
                     ok = bool(result.get("ok", False))
                     enabled = bool(result.get("enabled", False))
@@ -2084,6 +2338,7 @@ def main():
                         last_left_motor_torque = 0.0
                         last_right_motor_torque = 0.0
                         last_imu_motor_command_time = 0.0
+                        last_torque_filter_time = 0.0
                         _send_imu_phase_motor_command_if_due(time.time(), force=True)
                     if ok and enabled:
                         app_runtime_enabled = True
@@ -2107,6 +2362,7 @@ def main():
                     last_left_motor_torque = 0.0
                     last_right_motor_torque = 0.0
                     last_imu_motor_command_time = 0.0
+                    last_torque_filter_time = 0.0
                     if str(getattr(gait_analysis, "current_motion_mode", "walking")) in STAIRS_DOWN_MANUAL_MODES:
                         gait_analysis.set_stairs_down_manual_assist(enabled=False)
                     motor_controller.emergency_stop()
@@ -2138,6 +2394,8 @@ def main():
             motor_controller.get_logger().warn(f"⚠️ APP未知消息类型: {msg_type}")
             return _error_response("unknown_type")
 
+        from .bluetooth_server import build_default_server
+
         bluetooth_server = build_default_server(
             log_info=motor_controller.get_logger().info,
             log_warn=motor_controller.get_logger().warn,
@@ -2145,6 +2403,7 @@ def main():
             on_message=_handle_bt_message,
         )
         bluetooth_server.start()
+        _startup_mark("蓝牙模块导入与服务启动")
         motor_controller.get_logger().info("✅ 蓝牙服务线程已启动")
     else:
         motor_controller.get_logger().info("🔕 蓝牙服务已禁用 (GAIT_BT_ENABLE=0)")
@@ -2213,10 +2472,8 @@ def main():
                             missing_sides.append("left")
                         if right_latest is None:
                             missing_sides.append("right")
-                        source_hint = (
-                            "检查有线CAN IMU、can接口和帧ID配置"
-                            if bool(getattr(gait_analysis, "imu_phase_is_wired", False))
-                            else "检查IMU连接"
+                        source_hint = str(
+                            getattr(gait_analysis, "imu_phase_source_check_hint", "请检查IMU连接")
                         )
                         motor_controller.get_logger().warn(
                             "⚠️ IMU相位模式尚未获得大腿IMU样本，"
@@ -2278,6 +2535,7 @@ def main():
                     gait_analysis.actual_right_torque = 0.0
                     last_left_motor_torque = 0.0
                     last_right_motor_torque = 0.0
+                    last_torque_filter_time = 0.0
                     _send_imu_phase_motor_command_if_due(current_time, force=True)
                     if current_time - last_missing_imu_sample_warn_time >= 1.0:
                         stale_sides = []
@@ -2285,10 +2543,8 @@ def main():
                             stale_sides.append("left")
                         if right_sample_stale:
                             stale_sides.append("right")
-                        source_hint = (
-                            "请检查有线CAN IMU数据流"
-                            if bool(getattr(gait_analysis, "imu_phase_is_wired", False))
-                            else "请检查IMU连接"
+                        source_hint = str(
+                            getattr(gait_analysis, "imu_phase_source_check_hint", "请检查IMU连接")
                         )
                         motor_controller.get_logger().warn(
                             "⚠️ IMU相位模式大腿IMU样本超时，"
@@ -2433,6 +2689,8 @@ def main():
             # 普通模式蓝牙 plot 遥测默认每5组控制样本打包；IMU相位模式固定按10Hz打包发送。
             if lhip_angle is not None and rhip_angle is not None:
                 mechanical_zero_ready = motor_controller.mechanical_zeroed
+                analysis_lhip_angle = float(lhip_angle)
+                analysis_rhip_angle = float(rhip_angle)
 
                 if mechanical_zero_ready:
                     # 更新步态分析
@@ -2445,6 +2703,12 @@ def main():
                         sensor_timestamp = right_ts
                     gait_analysis.process_input_data(
                         rhip_angle, lhip_angle, rhip_velocity, lhip_velocity, sensor_timestamp
+                    )
+                    analysis_lhip_angle = float(
+                        getattr(gait_analysis, "current_left_motor_angle", analysis_lhip_angle)
+                    )
+                    analysis_rhip_angle = float(
+                        getattr(gait_analysis, "current_right_motor_angle", analysis_rhip_angle)
                     )
                 
                 # 使用独立计算的左右电机助力力矩
@@ -2506,7 +2770,7 @@ def main():
                 
                 # 记录数据到CSV文件
                 if lhip_angle is not None and rhip_angle is not None:
-                    # 获取当前相位值（test/walking_test使用独立右腿相位，其它模式右腿=左腿+π）
+                    # 获取当前相位值（测试/IMU模式使用各自已计算的右腿相位，其它模式右腿=左腿+π）
                     phase_left_raw = float(getattr(gait_analysis, "phi_L", 0.0))
                     try:
                         phase_left = gait_analysis._wrap_to_2pi(phase_left_raw)
@@ -2514,7 +2778,11 @@ def main():
                         phase_left = phase_left_raw
                     try:
                         if (
-                            getattr(gait_analysis, "current_motion_mode", "") in ("test", "walking_test")
+                            getattr(gait_analysis, "current_motion_mode", "") in (
+                                "test",
+                                "walking_test",
+                                "walking_diff_test",
+                            )
                             or getattr(gait_analysis, "current_motion_mode", "") in IMU_PHASE_MODES
                         ):
                             phase_right_raw = float(
@@ -2528,8 +2796,8 @@ def main():
                     
                     # 记录数据到 RealTimeGaitAnalysis 的日志（gait_logs 目录）
                     gait_analysis.log_data(
-                        left_angle=lhip_angle,
-                        right_angle=rhip_angle,
+                        left_angle=analysis_lhip_angle,
+                        right_angle=analysis_rhip_angle,
                         left_velocity=lhip_velocity,
                         right_velocity=rhip_velocity,
                         phase_left=phase_left,
@@ -2542,8 +2810,8 @@ def main():
                     
                     # 同时记录到 MotorController 的校准日志（calibration_logs 目录）
                     motor_controller.log_complete_gait_data(
-                        left_angle=lhip_angle,
-                        right_angle=rhip_angle,
+                        left_angle=analysis_lhip_angle,
+                        right_angle=analysis_rhip_angle,
                         left_velocity=lhip_velocity,
                         right_velocity=rhip_velocity,
                         phase_left=phase_left,
@@ -2557,8 +2825,8 @@ def main():
                     if bluetooth_server is not None and bt_plot_enabled and app_runtime_enabled:
                         payload = _build_gait_plot_payload(
                             ts=sensor_timestamp if sensor_timestamp is not None else current_time,
-                            left_angle=lhip_angle,
-                            right_angle=rhip_angle,
+                            left_angle=analysis_lhip_angle,
+                            right_angle=analysis_rhip_angle,
                             left_velocity=lhip_velocity,
                             right_velocity=rhip_velocity,
                             phase_left=phase_left,
@@ -2591,19 +2859,43 @@ def main():
                             motion_confirmed=motion_confirmed,
                         )
                 
-                # 添加平滑处理，避免 MIT 力矩突变；静止门控关闭时立即清零，不保留尾力矩。
+                # 添加平滑和斜率限制，避免 MIT 力矩突变；静止门控关闭时立即清零，不保留尾力矩。
                 if imu_phase_motion_inactive:
                     filtered_left_torque = 0.0
                     filtered_right_torque = 0.0
+                    last_torque_filter_time = current_time
                 else:
-                    filtered_left_torque = (
+                    torque_dt = (
+                        current_time - last_torque_filter_time
+                        if last_torque_filter_time > 0.0
+                        else imu_motor_command_period_sec
+                    )
+                    if torque_dt <= 0.0 or torque_dt > 0.2:
+                        torque_dt = imu_motor_command_period_sec
+                    smoothed_left_torque = (
                         torque_filter_alpha * new_left_motor_torque
                         + (1 - torque_filter_alpha) * last_left_motor_torque
                     )
-                    filtered_right_torque = (
+                    smoothed_right_torque = (
                         torque_filter_alpha * new_right_motor_torque
                         + (1 - torque_filter_alpha) * last_right_motor_torque
                     )
+                    if torque_slew_rate_nm_s > 0.0:
+                        max_delta = torque_slew_rate_nm_s * max(torque_dt, 1e-3)
+                        filtered_left_torque = last_left_motor_torque + _clamp_float(
+                            smoothed_left_torque - last_left_motor_torque,
+                            -max_delta,
+                            max_delta,
+                        )
+                        filtered_right_torque = last_right_motor_torque + _clamp_float(
+                            smoothed_right_torque - last_right_motor_torque,
+                            -max_delta,
+                            max_delta,
+                        )
+                    else:
+                        filtered_left_torque = smoothed_left_torque
+                        filtered_right_torque = smoothed_right_torque
+                    last_torque_filter_time = current_time
                 last_left_motor_torque = filtered_left_torque
                 last_right_motor_torque = filtered_right_torque
                 

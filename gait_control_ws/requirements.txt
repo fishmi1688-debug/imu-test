@@ -6,6 +6,7 @@
 numpy
 PyYAML
 matplotlib
+joblib
 
 # Bluetooth / BLE runtime dependencies
 # BLE Notify / GATT peripheral on Linux requires BlueZ + D-Bus + GObject introspection.

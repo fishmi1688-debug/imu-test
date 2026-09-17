@@ -1,0 +1,12 @@
+Keras vs phase_predictions 对比摘要
+source_session_dir: /media/zhang/新加卷/wc/test/imu+model+trian/步态模型/data/20260402_130343
+isolated_run_dir: /media/zhang/新加卷/wc/test/imu+model+trian/步态模型/data/keras_phase_compare/20260430_091510/20260402_130343
+model: /media/zhang/新加卷/wc/test/imu+model+trian/步态模型/gait_phase_model.keras
+scaler: /media/zhang/新加卷/wc/test/imu+model+trian/步态模型/feature_scaler.pkl
+reference_rows(onnx_csv): 1961
+generated_rows(keras): 1808
+aligned_rows: 1808
+alignment: timestamp_us
+mae_percent: 0.000005
+rmse_percent: 0.000007
+max_abs_percent: 0.000022

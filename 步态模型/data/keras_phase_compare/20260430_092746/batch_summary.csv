@@ -1,0 +1,2 @@
+session_name,session_dir,session_run_dir,alignment,reference_rows,generated_rows,aligned_rows,mae_percent,rmse_percent,max_abs_percent,plot_png
+20260402_130221,/media/zhang/新加卷/wc/test/imu+model+trian/步态模型/data/20260402_130221,/media/zhang/新加卷/wc/test/imu+model+trian/步态模型/data/keras_phase_compare/20260430_092746/20260402_130221,timestamp_us,2212,2212,2212,3.278034253443229e-06,4.792220727413156e-06,2.2913030472970775e-05,/media/zhang/新加卷/wc/test/imu+model+trian/步态模型/data/keras_phase_compare/20260430_092746/20260402_130221/outputs/phase_compare_onnx_vs_keras.png

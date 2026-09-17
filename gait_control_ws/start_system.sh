@@ -9,6 +9,26 @@ NC='\033[0m' # No Color
 
 CAN_INTERFACE="${GAIT_CAN_INTERFACE:-can0}"
 CAN_BITRATE="${GAIT_CAN_BITRATE:-1000000}"
+PYTHON_BIN="${GAIT_PYTHON_BIN:-/usr/bin/python3}"
+if [ ! -x "$PYTHON_BIN" ]; then
+    PYTHON_BIN="python3"
+fi
+export GAIT_PYTHON_BIN="$PYTHON_BIN"
+GAIT_SCRIPT_START_MS="$(date +%s%3N)"
+GAIT_SCRIPT_LAST_MS="$GAIT_SCRIPT_START_MS"
+
+log_stage_elapsed() {
+    local label="$1"
+    local now_ms
+    now_ms="$(date +%s%3N)"
+    local step_ms=$((now_ms - GAIT_SCRIPT_LAST_MS))
+    local total_ms=$((now_ms - GAIT_SCRIPT_START_MS))
+    printf "${BLUE}⏱️ 脚本耗时 %s: +%d.%03ds, total=%d.%03ds${NC}\n" \
+        "$label" \
+        $((step_ms / 1000)) $((step_ms % 1000)) \
+        $((total_ms / 1000)) $((total_ms % 1000))
+    GAIT_SCRIPT_LAST_MS="$now_ms"
+}
 
 # 工作区优先使用脚本所在目录，避免root用户下 ~ 指向 /root 导致路径错误
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,6 +71,7 @@ if [ -z "$GAIT_SUDO_RERUN" ] && [ "$(id -u)" -ne 0 ]; then
             GAIT_RUNTIME_LOG_DIR="${GAIT_RUNTIME_LOG_DIR}" \
             GAIT_RUN_LOG_TIMESTAMP="${GAIT_RUN_LOG_TIMESTAMP}" \
             GAIT_RUN_LOG_FILE="${GAIT_RUN_LOG_FILE}" \
+            GAIT_PYTHON_BIN="${GAIT_PYTHON_BIN}" \
             PYTHONUNBUFFERED="${PYTHONUNBUFFERED}" \
             "$0" "$@"
         SUDO_STATUS=$?
@@ -72,6 +93,42 @@ if [ ! -f "setup_env.sh" ] || [ ! -f "setup_can.sh" ]; then
     exit 1
 fi
 
+load_i2c_gpio_modules() {
+    local MODPROBE_CMD=(modprobe)
+    if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo >/dev/null 2>&1; then
+            MODPROBE_CMD=(sudo -E modprobe)
+        else
+            echo -e "${YELLOW}⚠️  当前非root且未找到sudo，无法加载i2c-gpio/i2c-dev模块${NC}"
+            return 1
+        fi
+    fi
+
+    echo -e "${YELLOW}⚙️  加载i2c-gpio-h2所需内核模块...${NC}"
+    "${MODPROBE_CMD[@]}" i2c-gpio || {
+        echo -e "${YELLOW}⚠️  加载i2c-gpio模块失败，可能无法发现i2c-gpio-h2${NC}"
+        return 1
+    }
+    "${MODPROBE_CMD[@]}" i2c-dev || {
+        echo -e "${YELLOW}⚠️  加载i2c-dev模块失败，可能无法访问/dev/i2c-*${NC}"
+        return 1
+    }
+    echo -e "${GREEN}✅ i2c-gpio/i2c-dev模块已加载${NC}"
+}
+
+# 有线IMU相位默认使用 MI1 CAN；只有显式选择 SEN0694/I2C 时才加载 I2C 模块。
+export GAIT_IMU_PHASE_SOURCE="${GAIT_IMU_PHASE_SOURCE:-mi1_can}"
+case "${GAIT_IMU_PHASE_SOURCE,,}" in
+    sen0694|sen0694_i2c|i2c|wired_i2c|dfrobot|dfrobot_sen0694)
+        load_i2c_gpio_modules || true
+        log_stage_elapsed "加载i2c模块"
+        ;;
+    *)
+        echo -e "${YELLOW}ℹ️  有线IMU相位源: ${GAIT_IMU_PHASE_SOURCE}，跳过SEN0694 I2C模块加载${NC}"
+        log_stage_elapsed "跳过i2c模块"
+        ;;
+esac
+
 # 设置环境
 echo -e "${YELLOW}⚙️  设置ROS2环境...${NC}"
 source ./setup_env.sh
@@ -81,7 +138,8 @@ if [ $? -ne 0 ]; then
 fi
 # 确保Python可以找到源码包（使用相对import的模块）
 export PYTHONPATH="$PWD/src:$PWD/src/gait_control_system:${PYTHONPATH}"
-# 有线IMU和电机共用同一个SocketCAN接口，默认都走 can0。
+log_stage_elapsed "设置ROS2环境"
+# MI1有线IMU和电机共用同一个SocketCAN接口，默认都走 can0。
 export GAIT_IMU_PHASE_CAN_INTERFACE="${GAIT_IMU_PHASE_CAN_INTERFACE:-$CAN_INTERFACE}"
 # 有线IMU不再阻塞APP BLE启动；开始助力时仍会按模式检查IMU数据流。
 export GAIT_IMU_PHASE_PRECONNECT="${GAIT_IMU_PHASE_PRECONNECT:-0}"
@@ -109,6 +167,10 @@ wait_for_condition() {
 
 is_can_interface_up() {
     ip link show "$CAN_INTERFACE" 2>/dev/null | grep -q -E 'state UP|<[^>]*UP[^>]*>'
+}
+
+does_can_interface_exist() {
+    ip link show "$CAN_INTERFACE" >/dev/null 2>&1
 }
 
 is_bluetooth_compat_ready() {
@@ -160,6 +222,15 @@ are_core_ros_nodes_ready() {
 wait_for_main_process_ready() {
     local pid="$1"
     local timeout_s="${2:-12}"
+    local ready_mode="${GAIT_MAIN_READY_CHECK:-process}"
+    if [ "$ready_mode" != "ros_nodes" ]; then
+        sleep "${GAIT_MAIN_START_CONFIRM_SEC:-0.1}"
+        if kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        return 1
+    fi
+
     local checks=$((timeout_s * 10))
     if [ "$checks" -lt 1 ]; then
         checks=1
@@ -379,7 +450,9 @@ EOF
 
 prepare_bluetooth_stack() {
     ensure_bluetooth_compat || true
-    restart_bluetooth_service || true
+    if [ "${GAIT_BT_RESTART_ON_START:-0}" = "1" ]; then
+        restart_bluetooth_service || true
+    fi
     stop_aux_bluetooth_services || true
 }
 
@@ -392,7 +465,11 @@ echo -e "${YELLOW}⚙️  配置CAN接口...${NC}"
 CAN_AVAILABLE=false
 
 # 检查系统默认CAN接口是否存在
-if ! ip link show "$CAN_INTERFACE" >/dev/null 2>&1; then
+if ! does_can_interface_exist; then
+    echo -e "${YELLOW}⏳ 等待默认CAN接口枚举: ${CAN_INTERFACE}${NC}"
+    wait_for_condition "${GAIT_CAN_EXIST_TIMEOUT:-4}" does_can_interface_exist || true
+fi
+if ! does_can_interface_exist; then
     echo -e "${YELLOW}⚠️  未检测到默认CAN接口: ${CAN_INTERFACE}${NC}"
     CAN_AVAILABLE=false
 else
@@ -413,6 +490,7 @@ else
         fi
     fi
 fi
+log_stage_elapsed "配置CAN接口"
 
 # 构建系统（如果需要）
 echo -e "${YELLOW}🔨 检查并构建系统...${NC}"
@@ -424,6 +502,7 @@ if [ ! -d "install/gait_control_system" ]; then
         exit 1
     fi
 fi
+log_stage_elapsed "构建检查"
 
 if [ "$CAN_AVAILABLE" = false ]; then
     echo -e "${YELLOW}⚠️  CAN设备不可用，进入降级模式（仅蓝牙服务）${NC}"
@@ -432,7 +511,7 @@ if [ "$CAN_AVAILABLE" = false ]; then
         prepare_bluetooth_stack || true
         ensure_bluetooth_discoverable || true
         echo -e "${YELLOW}📡 启动蓝牙RFCOMM服务...${NC}"
-        BT_CMD=(python3 -u -m gait_control_system.gait_control_system.bluetooth_server)
+        BT_CMD=("$GAIT_PYTHON_BIN" -u -m gait_control_system.gait_control_system.bluetooth_server)
         if [ "$(id -u)" -ne 0 ]; then
             if command -v sudo >/dev/null 2>&1; then
                 sudo -E "${BT_CMD[@]}" &
@@ -463,14 +542,40 @@ fi
 echo -e "${BLUE}🔄 启动完整系统...${NC}"
 # 在后台启动主程序
 echo -e "${YELLOW}🤖 启动步态控制主程序...${NC}"
-prepare_bluetooth_stack || true
-ensure_bluetooth_discoverable || true
-python3 -u -m gait_control_system.gait_control_system.last3_optimized &
+if [ "${GAIT_BT_PREPARE_BEFORE_MAIN:-0}" = "1" ]; then
+    prepare_bluetooth_stack || true
+    ensure_bluetooth_discoverable || true
+else
+    echo -e "${YELLOW}⚡ 快速开机助力: 不在主程序启动前等待蓝牙准备${NC}"
+fi
+export GAIT_MAIN_LAUNCH_WALL_TS="$(date +%s.%N)"
+"$GAIT_PYTHON_BIN" -u -m gait_control_system.gait_control_system.last3_optimized &
 MAIN_PID=$!
+log_stage_elapsed "启动Python主进程"
+if [ "${GAIT_BT_ENABLE:-1}" != "0" ] && [ "${GAIT_BT_PREPARE_BEFORE_MAIN:-0}" != "1" ]; then
+    (
+        BT_PREP_DELAY_SEC="${GAIT_BT_PREPARE_DELAY_SEC:-10}"
+        if [ "$BT_PREP_DELAY_SEC" != "0" ]; then
+            sleep "$BT_PREP_DELAY_SEC"
+        fi
+        if ! kill -0 "$MAIN_PID" 2>/dev/null; then
+            exit 0
+        fi
+        prepare_bluetooth_stack || true
+        ensure_bluetooth_discoverable || true
+    ) &
+    BT_PREP_PID=$!
+    echo -e "${YELLOW}📶 蓝牙准备已转入后台，延迟${GAIT_BT_PREPARE_DELAY_SEC:-10}s执行，PID: $BT_PREP_PID${NC}"
+fi
 wait_for_main_process_ready "$MAIN_PID" "${GAIT_MAIN_READY_TIMEOUT:-12}"
 READY_STATUS=$?
+log_stage_elapsed "主进程就绪确认"
 if [ $READY_STATUS -eq 0 ]; then
-    echo -e "${GREEN}✅ 系统启动完成（核心ROS节点已就绪）${NC}"
+    if [ "${GAIT_MAIN_READY_CHECK:-process}" = "ros_nodes" ]; then
+        echo -e "${GREEN}✅ 系统启动完成（核心ROS节点已就绪）${NC}"
+    else
+        echo -e "${GREEN}✅ 主程序进程已启动（默认助力流程由主程序继续执行）${NC}"
+    fi
 elif [ $READY_STATUS -eq 1 ]; then
     echo -e "${RED}❌ 主程序启动失败（进程已退出）${NC}"
     exit 1
@@ -479,7 +584,7 @@ else
 fi
 echo -e "${YELLOW}💡 主程序PID: $MAIN_PID${NC}"
 echo -e "${YELLOW}💡 按 Ctrl+C 停止系统${NC}"
-trap "echo -e '\n${YELLOW}🛑 停止系统...${NC}'; kill $MAIN_PID 2>/dev/null; exit" INT
+trap "echo -e '\n${YELLOW}🛑 停止系统...${NC}'; kill $MAIN_PID 2>/dev/null; if [ -n \"${BT_PREP_PID:-}\" ]; then kill $BT_PREP_PID 2>/dev/null; fi; exit" INT
 wait
 
 echo -e "${GREEN}✅ 系统已退出${NC}"
