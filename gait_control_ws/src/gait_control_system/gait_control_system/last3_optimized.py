@@ -229,6 +229,25 @@ def main():
         0.0,
         _read_env_float("GAIT_TORQUE_SLEW_RATE_NM_S", 60.0),
     )  # 0 表示关闭斜率限制
+    fast_static_stop_enabled = (
+        os.environ.get("GAIT_FAST_STATIC_STOP_ENABLE", "1").strip().lower()
+        not in ("0", "false", "no", "off")
+    )
+    fast_static_stop_hold_sec = max(
+        0.03,
+        _read_env_float("GAIT_FAST_STATIC_STOP_HOLD_SEC", 0.14),
+    )
+    fast_static_stop_velocity_rad_s = max(
+        0.0,
+        _read_env_float("GAIT_FAST_STATIC_STOP_VEL_RAD_S", 0.25),
+    )
+    fast_static_stop_angle_range_rad = max(
+        0.0,
+        _read_env_float("GAIT_FAST_STATIC_STOP_ANGLE_RANGE_RAD", 0.045),
+    )
+    fast_static_stop_samples = deque()
+    fast_static_stop_active = False
+    last_fast_static_stop_log_time = 0.0
     last_state_signature = None
     last_state_send_time = 0.0
     last_imu_status_signature = None
@@ -245,6 +264,26 @@ def main():
     last_imu_stale_restart_time_by_side = {"left": 0.0, "right": 0.0}
     last_bt_ping_log_time = 0.0
     bt_plot_batch_frames = []
+    bt_plot_last_safe_values = {
+        "l": 0.0,
+        "r": 0.0,
+        "d": 0.0,
+        "p": 0.0,
+        "a": 0.0,
+        "lv": 0.0,
+        "rv": 0.0,
+        "ra": 0.0,
+    }
+    bt_plot_last_safe_initialized = set()
+    bt_plot_last_safe_mode = None
+    bt_plot_max_angle_jump_deg = max(
+        0.0,
+        _read_env_float("GAIT_BT_PLOT_MAX_ANGLE_JUMP_DEG", 45.0),
+    )
+    bt_plot_max_velocity_jump_deg_s = max(
+        0.0,
+        _read_env_float("GAIT_BT_PLOT_MAX_VELOCITY_JUMP_DEG_S", 900.0),
+    )
     bt_plot_batch_size = max(1, int(os.environ.get("GAIT_BT_PLOT_BATCH_SIZE", "5")))
     bt_plot_every_n_frames = max(1, int(os.environ.get("GAIT_BT_PLOT_EVERY_N_FRAMES", "25")))
     bt_plot_mode = str(os.environ.get("GAIT_BT_PLOT_MODE", "batch")).strip().lower()
@@ -770,6 +809,97 @@ def main():
                 f"🛑 已发送零力矩停止助力: {reason}, left_ok={left_ok}, right_ok={right_ok}"
             )
 
+    def _reset_fast_static_stop_gate() -> None:
+        nonlocal fast_static_stop_active
+        fast_static_stop_samples.clear()
+        fast_static_stop_active = False
+
+    def _update_fast_static_stop_gate(
+        now: float,
+        left_angle: float,
+        right_angle: float,
+        left_velocity: float,
+        right_velocity: float,
+        mode: str,
+    ) -> bool:
+        """连续低角速度且角度几乎不变时，快速切断助力输出。"""
+        nonlocal fast_static_stop_active
+        nonlocal last_fast_static_stop_log_time
+
+        if not fast_static_stop_enabled:
+            _reset_fast_static_stop_gate()
+            return False
+        if (
+            not app_runtime_enabled
+            or not bool(getattr(motor_controller, "mechanical_zeroed", False))
+            or not bool(getattr(gait_analysis, "assist_enable", False))
+        ):
+            _reset_fast_static_stop_gate()
+            return False
+
+        try:
+            sample = (
+                float(now),
+                float(left_angle),
+                float(right_angle),
+                float(left_velocity),
+                float(right_velocity),
+            )
+        except Exception:
+            _reset_fast_static_stop_gate()
+            return False
+        if not all(np.isfinite(value) for value in sample):
+            _reset_fast_static_stop_gate()
+            return False
+
+        fast_static_stop_samples.append(sample)
+        cutoff_time = sample[0] - fast_static_stop_hold_sec
+        while len(fast_static_stop_samples) > 1 and fast_static_stop_samples[0][0] < cutoff_time:
+            fast_static_stop_samples.popleft()
+
+        window_sec = fast_static_stop_samples[-1][0] - fast_static_stop_samples[0][0]
+        if window_sec < fast_static_stop_hold_sec:
+            return fast_static_stop_active
+
+        left_angles = [item[1] for item in fast_static_stop_samples]
+        right_angles = [item[2] for item in fast_static_stop_samples]
+        max_abs_velocity = max(
+            max(abs(item[3]), abs(item[4])) for item in fast_static_stop_samples
+        )
+        max_angle_range = max(
+            max(left_angles) - min(left_angles),
+            max(right_angles) - min(right_angles),
+        )
+        static_detected = bool(
+            max_abs_velocity <= fast_static_stop_velocity_rad_s
+            and max_angle_range <= fast_static_stop_angle_range_rad
+        )
+
+        if static_detected:
+            if (
+                not fast_static_stop_active
+                or sample[0] - last_fast_static_stop_log_time >= 1.0
+            ):
+                motor_controller.get_logger().info(
+                    "🛑 快速静止门控触发: "
+                    f"mode={mode}, window={window_sec:.3f}s, "
+                    f"max_vel={max_abs_velocity:.3f}rad/s, "
+                    f"angle_range={max_angle_range:.3f}rad"
+                )
+                last_fast_static_stop_log_time = sample[0]
+            fast_static_stop_active = True
+            return True
+
+        if fast_static_stop_active and sample[0] - last_fast_static_stop_log_time >= 0.5:
+            motor_controller.get_logger().info(
+                "🚶 快速静止门控释放: "
+                f"mode={mode}, max_vel={max_abs_velocity:.3f}rad/s, "
+                f"angle_range={max_angle_range:.3f}rad"
+            )
+            last_fast_static_stop_log_time = sample[0]
+        fast_static_stop_active = False
+        return False
+
     def _stop_runtime_assist(reason: str, *, send_zero: bool = True) -> None:
         nonlocal app_runtime_enabled
         nonlocal last_left_motor_torque
@@ -778,6 +908,7 @@ def main():
         nonlocal last_torque_filter_time
         nonlocal last_torque_filter_time
         app_runtime_enabled = False
+        _reset_fast_static_stop_gate()
         last_left_motor_torque = 0.0
         last_right_motor_torque = 0.0
         last_imu_motor_command_time = 0.0
@@ -1290,6 +1421,7 @@ def main():
                 and mechanical_zero_ready
                 and motion_confirmed
                 and gait_analysis.assist_enable
+                and not bool(getattr(gait_analysis, "fast_static_stop_active", False))
             )
             payload = {
                 "type": "state",
@@ -1361,6 +1493,7 @@ def main():
                 and mechanical_zero_ready
                 and motion_confirmed
                 and gait_analysis.assist_enable
+                and not bool(getattr(gait_analysis, "fast_static_stop_active", False))
             )
             imu_status = _build_imu_status_fields()
             flag_values = {
@@ -1548,6 +1681,57 @@ def main():
             # 同时固定绘制左腿助力，避免左右腿混用导致图形跳变。
             return float(phase_left), float(assist_left)
 
+        def _bt_finite_float(value: float, default: float = 0.0) -> float:
+            try:
+                result = float(value)
+            except Exception:
+                return float(default)
+            if not np.isfinite(result):
+                return float(default)
+            return result
+
+        def _plot_display_limit(side: str, kind: str) -> float:
+            try:
+                return float(gait_analysis._imu_phase_display_limit(side, kind))
+            except Exception:
+                if kind == "gyro":
+                    return 800.0 if side != "diff" else 1600.0
+                return 170.0 if side != "diff" else 220.0
+
+        def _plot_safe_value(
+            key: str,
+            value: float,
+            *,
+            max_abs: float = 0.0,
+            max_jump: float = 0.0,
+            hold_previous: bool = False,
+        ) -> float:
+            fallback = _bt_finite_float(bt_plot_last_safe_values.get(key, 0.0), 0.0)
+            if hold_previous:
+                return fallback
+            result = _bt_finite_float(value, fallback)
+            limit = max(0.0, float(max_abs))
+            if limit > 0.0 and abs(result) > limit:
+                return fallback
+            jump_limit = max(0.0, float(max_jump))
+            if (
+                key in bt_plot_last_safe_initialized
+                and jump_limit > 0.0
+                and abs(result - fallback) > jump_limit
+            ):
+                return fallback
+            bt_plot_last_safe_values[key] = result
+            bt_plot_last_safe_initialized.add(key)
+            return result
+
+        def _plot_safe_phase_rad(value: float, *, hold_previous: bool = False) -> float:
+            fallback = _bt_finite_float(bt_plot_last_safe_values.get("p", 0.0), 0.0)
+            if hold_previous:
+                return fallback
+            result = _bt_finite_float(value, fallback) % (2.0 * np.pi)
+            bt_plot_last_safe_values["p"] = result
+            return result
+
         def _build_gait_plot_payload(
             *,
             ts: float,
@@ -1560,6 +1744,7 @@ def main():
             assist_left: float,
             assist_right: float,
         ) -> dict:
+            nonlocal bt_plot_last_safe_mode
             phase, assist = _select_plot_phase_and_assist(
                 phase_left=phase_left,
                 phase_right=phase_right,
@@ -1567,30 +1752,70 @@ def main():
                 assist_right=assist_right,
             )
             current_mode = str(getattr(gait_analysis, "current_motion_mode", "walking"))
-            plot_left_angle = float(left_angle)
-            plot_right_angle = float(right_angle)
-            plot_left_velocity = float(left_velocity)
-            plot_right_velocity = float(right_velocity)
+            if current_mode != bt_plot_last_safe_mode:
+                bt_plot_last_safe_initialized.clear()
+                bt_plot_last_safe_mode = current_mode
+            imu_phase_plot = current_mode in IMU_PHASE_MODES
+            imu_phase_abnormal = bool(
+                imu_phase_plot and getattr(gait_analysis, "imu_phase_abnormal_sample", False)
+            )
+            phase = _plot_safe_phase_rad(phase, hold_previous=imu_phase_abnormal)
+            assist = _plot_safe_value("a", assist, max_abs=17.0)
+            assist_right = _plot_safe_value("ra", assist_right, max_abs=17.0)
+            plot_left_angle = _bt_finite_float(left_angle)
+            plot_right_angle = _bt_finite_float(right_angle)
+            plot_left_velocity = _bt_finite_float(left_velocity)
+            plot_right_velocity = _bt_finite_float(right_velocity)
             if current_mode in IMU_PHASE_MODES:
-                plot_left_angle = float(
-                    getattr(gait_analysis, "imu_phase_left_angle_deg", plot_left_angle)
+                plot_left_angle = _plot_safe_value(
+                    "l",
+                    getattr(gait_analysis, "imu_phase_left_angle_deg", plot_left_angle),
+                    max_abs=_plot_display_limit("left", "angle"),
+                    max_jump=bt_plot_max_angle_jump_deg,
+                    hold_previous=imu_phase_abnormal,
                 )
-                plot_right_angle = float(
-                    getattr(gait_analysis, "imu_phase_right_angle_deg", plot_right_angle)
+                plot_right_angle = _plot_safe_value(
+                    "r",
+                    getattr(gait_analysis, "imu_phase_right_angle_deg", plot_right_angle),
+                    max_abs=_plot_display_limit("right", "angle"),
+                    max_jump=bt_plot_max_angle_jump_deg,
+                    hold_previous=imu_phase_abnormal,
                 )
-                plot_left_velocity = float(
-                    getattr(gait_analysis, "imu_phase_left_angular_velocity_deg_s", 0.0)
+                plot_left_velocity = _plot_safe_value(
+                    "lv",
+                    getattr(gait_analysis, "imu_phase_left_angular_velocity_deg_s", 0.0),
+                    max_abs=_plot_display_limit("left", "gyro"),
+                    max_jump=bt_plot_max_velocity_jump_deg_s,
+                    hold_previous=imu_phase_abnormal,
                 )
-                plot_right_velocity = float(
-                    getattr(gait_analysis, "imu_phase_right_angular_velocity_deg_s", 0.0)
+                plot_right_velocity = _plot_safe_value(
+                    "rv",
+                    getattr(gait_analysis, "imu_phase_right_angular_velocity_deg_s", 0.0),
+                    max_abs=_plot_display_limit("right", "gyro"),
+                    max_jump=bt_plot_max_velocity_jump_deg_s,
+                    hold_previous=imu_phase_abnormal,
                 )
+            else:
+                plot_left_angle = _plot_safe_value("l", plot_left_angle)
+                plot_right_angle = _plot_safe_value("r", plot_right_angle)
+                plot_left_velocity = _plot_safe_value("lv", plot_left_velocity)
+                plot_right_velocity = _plot_safe_value("rv", plot_right_velocity)
+
+            plot_diff = _plot_safe_value(
+                "d",
+                float(plot_left_angle) - float(plot_right_angle),
+                max_abs=2.0 * max(_plot_display_limit("left", "angle"), 1.0)
+                if imu_phase_plot
+                else 0.0,
+                hold_previous=imu_phase_abnormal,
+            )
 
             payload = {
                 "x": _bt_round(ts, 3),
                 "l": _bt_round(plot_left_angle),
                 "r": _bt_round(plot_right_angle),
                 # Keep telemetry consistent with RAO input definition: q = theta_l - theta_r.
-                "d": _bt_round(float(plot_left_angle) - float(plot_right_angle)),
+                "d": _bt_round(plot_diff),
                 "p": _bt_round(phase),
                 "a": _bt_round(assist),
             }
@@ -2691,6 +2916,9 @@ def main():
                 mechanical_zero_ready = motor_controller.mechanical_zeroed
                 analysis_lhip_angle = float(lhip_angle)
                 analysis_rhip_angle = float(rhip_angle)
+                fast_static_stop_was_active = fast_static_stop_active
+                fast_static_stop_now = False
+                gait_analysis.fast_static_stop_active = False
 
                 if mechanical_zero_ready:
                     # 更新步态分析
@@ -2710,6 +2938,63 @@ def main():
                     analysis_rhip_angle = float(
                         getattr(gait_analysis, "current_right_motor_angle", analysis_rhip_angle)
                     )
+
+                    fast_stop_left_angle = analysis_lhip_angle
+                    fast_stop_right_angle = analysis_rhip_angle
+                    fast_stop_left_velocity = float(lhip_velocity)
+                    fast_stop_right_velocity = float(rhip_velocity)
+                    if imu_phase_mode:
+                        fast_stop_left_angle = float(
+                            np.deg2rad(
+                                getattr(
+                                    gait_analysis,
+                                    "imu_phase_left_angle_deg",
+                                    np.rad2deg(analysis_lhip_angle),
+                                )
+                            )
+                        )
+                        fast_stop_left_velocity = float(
+                            np.deg2rad(
+                                getattr(
+                                    gait_analysis,
+                                    "imu_phase_left_angular_velocity_deg_s",
+                                    np.rad2deg(float(lhip_velocity)),
+                                )
+                            )
+                        )
+                        if current_motion_mode in SINGLE_IMU_PHASE_MODES:
+                            fast_stop_right_angle = -fast_stop_left_angle
+                            fast_stop_right_velocity = -fast_stop_left_velocity
+                        else:
+                            fast_stop_right_angle = float(
+                                np.deg2rad(
+                                    getattr(
+                                        gait_analysis,
+                                        "imu_phase_right_angle_deg",
+                                        np.rad2deg(analysis_rhip_angle),
+                                    )
+                                )
+                            )
+                            fast_stop_right_velocity = float(
+                                np.deg2rad(
+                                    getattr(
+                                        gait_analysis,
+                                        "imu_phase_right_angular_velocity_deg_s",
+                                        np.rad2deg(float(rhip_velocity)),
+                                    )
+                                )
+                            )
+                    fast_static_stop_now = _update_fast_static_stop_gate(
+                        current_time,
+                        fast_stop_left_angle,
+                        fast_stop_right_angle,
+                        fast_stop_left_velocity,
+                        fast_stop_right_velocity,
+                        current_motion_mode,
+                    )
+                    gait_analysis.fast_static_stop_active = bool(fast_static_stop_now)
+                    if fast_static_stop_now and imu_phase_mode:
+                        gait_analysis.imu_phase_motion_active = False
                 
                 # 使用独立计算的左右电机助力力矩
                 if mechanical_zero_ready and gait_analysis.left_hipAss and gait_analysis.right_hipAss:
@@ -2729,12 +3014,18 @@ def main():
                     imu_phase_mode
                     and not bool(getattr(gait_analysis, "imu_phase_motion_active", False))
                 )
+                imu_phase_abnormal_now = bool(
+                    imu_phase_mode
+                    and bool(getattr(gait_analysis, "imu_phase_abnormal_sample", False))
+                )
                 if (
                     not app_runtime_enabled
                     or (mechanical_zero_ready and not gait_analysis.assist_enable)
                     or not mechanical_zero_ready
                     or not motion_confirmed
                     or imu_phase_motion_inactive
+                    or imu_phase_abnormal_now
+                    or fast_static_stop_now
                 ):
                     left_torque = 0.0
                     right_torque = 0.0
@@ -2747,6 +3038,11 @@ def main():
                             motor_controller.get_logger().info("🛑 运动未确认，力矩保持为零")
                         elif imu_phase_motion_inactive:
                             motor_controller.get_logger().info("🛑 IMU相位静止/轻微摆动，力矩保持为零")
+                        elif imu_phase_abnormal_now:
+                            reason = str(getattr(gait_analysis, "imu_phase_abnormal_reason", "") or "")
+                            motor_controller.get_logger().info(f"🛑 IMU异常样本({reason})，力矩保持为零")
+                        elif fast_static_stop_now:
+                            motor_controller.get_logger().info("🛑 快速静止门控生效，力矩保持为零")
                         elif not gait_analysis.assist_enable:
                             motor_controller.get_logger().info("🛑 助力已禁用，强制力矩为零")
 
@@ -2755,6 +3051,8 @@ def main():
                     and mechanical_zero_ready
                     and motion_confirmed
                     and gait_analysis.assist_enable
+                    and not imu_phase_abnormal_now
+                    and not fast_static_stop_now
                 )
                 assist_output_active = bool(
                     assist_armed and (abs(left_torque) > 1e-6 or abs(right_torque) > 1e-6)
@@ -2805,7 +3103,7 @@ def main():
                         assist_left=left_torque,
                         assist_right=right_torque,
                         motion_detected=gait_analysis.assist_enable,
-                        assist_enabled=app_runtime_enabled and mechanical_zero_ready and motion_confirmed and gait_analysis.assist_enable
+                        assist_enabled=assist_armed
                     )
                     
                     # 同时记录到 MotorController 的校准日志（calibration_logs 目录）
@@ -2819,7 +3117,7 @@ def main():
                         assist_left=left_torque,
                         assist_right=right_torque,
                         motion_detected=gait_analysis.assist_enable,
-                        assist_enabled=app_runtime_enabled and mechanical_zero_ready and motion_confirmed and gait_analysis.assist_enable
+                        assist_enabled=assist_armed
                     )
                     
                     if bluetooth_server is not None and bt_plot_enabled and app_runtime_enabled:
@@ -2860,10 +3158,29 @@ def main():
                         )
                 
                 # 添加平滑和斜率限制，避免 MIT 力矩突变；静止门控关闭时立即清零，不保留尾力矩。
-                if imu_phase_motion_inactive:
+                if imu_phase_motion_inactive or imu_phase_abnormal_now or fast_static_stop_now:
                     filtered_left_torque = 0.0
                     filtered_right_torque = 0.0
                     last_torque_filter_time = current_time
+                    if (
+                        fast_static_stop_now
+                        and not fast_static_stop_was_active
+                        and mechanical_zero_ready
+                    ):
+                        last_left_motor_torque = 0.0
+                        last_right_motor_torque = 0.0
+                        _send_zero_torque_now("快速静止门控")
+                        last_imu_motor_command_time = current_time
+                    elif (
+                        imu_phase_abnormal_now
+                        and mechanical_zero_ready
+                        and (abs(last_left_motor_torque) > 1e-6 or abs(last_right_motor_torque) > 1e-6)
+                    ):
+                        last_left_motor_torque = 0.0
+                        last_right_motor_torque = 0.0
+                        reason = str(getattr(gait_analysis, "imu_phase_abnormal_reason", "") or "IMU异常样本")
+                        _send_zero_torque_now(reason)
+                        last_imu_motor_command_time = current_time
                 else:
                     torque_dt = (
                         current_time - last_torque_filter_time

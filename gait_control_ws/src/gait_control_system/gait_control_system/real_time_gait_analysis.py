@@ -3,6 +3,7 @@ import math
 import os
 import time
 from collections import deque
+from dataclasses import replace
 from datetime import datetime
 
 import numpy as np
@@ -102,6 +103,8 @@ PHASE_INPUT_DEADZONE_ANGLE = 0.1     # 相位输入角度死区：|angle_diff|<�
 MOTOR_ANGLE_LPF_CUTOFF_HZ = 4.0      # 所有电机编码器角度一阶低通截止频率
 IMU_PHASE_ANGLE_LPF_CUTOFF_HZ = 6.0  # 大腿矢状面角度/角速度一阶低通截止频率
 DIFF_TEST_MOTOR_ANGLE_LPF_CUTOFF_HZ = 4.0  # 差分测试模式电机角度一阶低通截止频率
+IMU_PHASE_DISPLAY_MAX_ANGLE_JUMP_DEG = 45.0  # 仅用于APP/日志显示的角度跳变保持阈值
+IMU_PHASE_DISPLAY_MAX_GYRO_JUMP_DEG_S = 900.0  # 仅用于APP/日志显示的角速度跳变保持阈值
 
 # 停止->运动切换时的起步初始相位参数（便于现场快速调参）
 START_PHASE_INIT_LEFT_FIRST = 0.0    # 左脚先迈时，左腿相位初始值（rad）
@@ -374,6 +377,30 @@ class RealTimeGaitAnalysis(Node):
             0.0,
             min(1.0, _read_env_float("GAIT_IMU_PHASE_MOTION_SWING_RANGE_RATIO", 0.25)),
         )
+        imu_phase_reject_abnormal_samples = _env_enabled(
+            "GAIT_IMU_PHASE_REJECT_ABNORMAL_SAMPLES",
+            False,
+        )
+        imu_phase_max_abs_angle_deg = max(
+            0.0,
+            _read_env_float("GAIT_IMU_PHASE_MAX_ABS_ANGLE_DEG", 170.0),
+        )
+        imu_phase_max_abs_gyro_deg_s = max(
+            0.0,
+            _read_env_float("GAIT_IMU_PHASE_MAX_ABS_GYRO_DEG_S", 600.0),
+        )
+        imu_phase_max_angle_jump_deg = max(
+            0.0,
+            _read_env_float("GAIT_IMU_PHASE_MAX_ANGLE_JUMP_DEG", 30.0),
+        )
+        imu_phase_max_gyro_jump_deg_s = max(
+            0.0,
+            _read_env_float("GAIT_IMU_PHASE_MAX_GYRO_JUMP_DEG_S", 600.0),
+        )
+        imu_phase_max_phase_rate_hz = max(
+            0.0,
+            _read_env_float("GAIT_IMU_PHASE_MAX_PHASE_RATE_HZ", 0.0),
+        )
         self.imu_phase_left_estimator = ThighImuPhaseEstimator(
             ImuPhaseConfig(
                 angle_sign=_read_env_float(
@@ -411,6 +438,44 @@ class RealTimeGaitAnalysis(Node):
                 motion_window_sec=imu_phase_motion_window_sec,
                 end_phase_stop_threshold=imu_phase_end_stop_threshold,
                 motion_swing_range_ratio=imu_phase_motion_swing_range_ratio,
+                reject_abnormal_samples=imu_phase_reject_abnormal_samples,
+                max_abs_angle_deg=_read_env_float(
+                    "GAIT_IMU_PHASE_LEFT_MAX_ABS_ANGLE_DEG",
+                    imu_phase_max_abs_angle_deg,
+                ),
+                max_abs_gyro_deg_s=_read_env_float(
+                    "GAIT_IMU_PHASE_LEFT_MAX_ABS_GYRO_DEG_S",
+                    imu_phase_max_abs_gyro_deg_s,
+                ),
+                max_angle_jump_deg=_read_env_float(
+                    "GAIT_IMU_PHASE_LEFT_MAX_ANGLE_JUMP_DEG",
+                    imu_phase_max_angle_jump_deg,
+                ),
+                max_gyro_jump_deg_s=_read_env_float(
+                    "GAIT_IMU_PHASE_LEFT_MAX_GYRO_JUMP_DEG_S",
+                    imu_phase_max_gyro_jump_deg_s,
+                ),
+                max_phase_rate_hz=imu_phase_max_phase_rate_hz,
+            )
+        )
+        # imu_left_phase alone uses the quaternion/vector sagittal-angle path
+        # from the dual-IMU improvement note. Other modes keep the existing
+        # left estimator so their phase inputs remain unchanged.
+        self.imu_phase_left_quaternion_estimator = ThighImuPhaseEstimator(
+            replace(
+                self.imu_phase_left_estimator.config,
+                angle_source="quat_sagittal",
+                gyro_source="quat_sagittal",
+                quaternion_thigh_axis=(1.0, 0.0, 0.0),
+                quaternion_sagittal_forward_axis="x",
+                quaternion_sagittal_vertical_axis="z",
+                quaternion_gyro_sagittal_axis="y",
+                reject_abnormal_samples=True,
+                max_phase_rate_hz=0.0,
+                max_abs_angle_deg=max(
+                    360.0,
+                    float(self.imu_phase_left_estimator.config.max_abs_angle_deg),
+                ),
             )
         )
         self.imu_phase_right_estimator = ThighImuPhaseEstimator(
@@ -450,6 +515,24 @@ class RealTimeGaitAnalysis(Node):
                 motion_window_sec=imu_phase_motion_window_sec,
                 end_phase_stop_threshold=imu_phase_end_stop_threshold,
                 motion_swing_range_ratio=imu_phase_motion_swing_range_ratio,
+                reject_abnormal_samples=imu_phase_reject_abnormal_samples,
+                max_abs_angle_deg=_read_env_float(
+                    "GAIT_IMU_PHASE_RIGHT_MAX_ABS_ANGLE_DEG",
+                    imu_phase_max_abs_angle_deg,
+                ),
+                max_abs_gyro_deg_s=_read_env_float(
+                    "GAIT_IMU_PHASE_RIGHT_MAX_ABS_GYRO_DEG_S",
+                    imu_phase_max_abs_gyro_deg_s,
+                ),
+                max_angle_jump_deg=_read_env_float(
+                    "GAIT_IMU_PHASE_RIGHT_MAX_ANGLE_JUMP_DEG",
+                    imu_phase_max_angle_jump_deg,
+                ),
+                max_gyro_jump_deg_s=_read_env_float(
+                    "GAIT_IMU_PHASE_RIGHT_MAX_GYRO_JUMP_DEG_S",
+                    imu_phase_max_gyro_jump_deg_s,
+                ),
+                max_phase_rate_hz=imu_phase_max_phase_rate_hz,
             )
         )
         self.imu_phase_diff_estimator = ThighImuPhaseEstimator(
@@ -479,6 +562,24 @@ class RealTimeGaitAnalysis(Node):
                 motion_window_sec=imu_phase_motion_window_sec,
                 end_phase_stop_threshold=imu_phase_end_stop_threshold,
                 motion_swing_range_ratio=imu_phase_motion_swing_range_ratio,
+                reject_abnormal_samples=imu_phase_reject_abnormal_samples,
+                max_abs_angle_deg=_read_env_float(
+                    "GAIT_IMU_PHASE_DIFF_MAX_ABS_ANGLE_DEG",
+                    max(220.0, imu_phase_max_abs_angle_deg),
+                ),
+                max_abs_gyro_deg_s=_read_env_float(
+                    "GAIT_IMU_PHASE_DIFF_MAX_ABS_GYRO_DEG_S",
+                    imu_phase_max_abs_gyro_deg_s * 2.0,
+                ),
+                max_angle_jump_deg=_read_env_float(
+                    "GAIT_IMU_PHASE_DIFF_MAX_ANGLE_JUMP_DEG",
+                    max(60.0, imu_phase_max_angle_jump_deg * 2.0),
+                ),
+                max_gyro_jump_deg_s=_read_env_float(
+                    "GAIT_IMU_PHASE_DIFF_MAX_GYRO_JUMP_DEG_S",
+                    imu_phase_max_gyro_jump_deg_s * 2.0,
+                ),
+                max_phase_rate_hz=imu_phase_max_phase_rate_hz,
             )
         )
         self.imu_phase_last_left_seq = 0
@@ -505,6 +606,32 @@ class RealTimeGaitAnalysis(Node):
         self.imu_phase_right_angular_velocity_deg_s = 0.0
         self.imu_phase_diff_angle_deg = 0.0
         self.imu_phase_diff_angular_velocity_deg_s = 0.0
+        self.imu_phase_left_safe_angle = 0.0
+        self.imu_phase_right_safe_angle = 0.0
+        self.imu_phase_diff_safe_angle = 0.0
+        self.imu_phase_left_safe_gyro = 0.0
+        self.imu_phase_right_safe_gyro = 0.0
+        self.imu_phase_diff_safe_gyro = 0.0
+        self.imu_phase_left_safe_angle_initialized = False
+        self.imu_phase_right_safe_angle_initialized = False
+        self.imu_phase_diff_safe_angle_initialized = False
+        self.imu_phase_left_safe_gyro_initialized = False
+        self.imu_phase_right_safe_gyro_initialized = False
+        self.imu_phase_diff_safe_gyro_initialized = False
+        self.imu_phase_display_max_angle_jump_deg = max(
+            0.0,
+            _read_env_float(
+                "GAIT_IMU_PHASE_DISPLAY_MAX_ANGLE_JUMP_DEG",
+                IMU_PHASE_DISPLAY_MAX_ANGLE_JUMP_DEG,
+            ),
+        )
+        self.imu_phase_display_max_gyro_jump_deg_s = max(
+            0.0,
+            _read_env_float(
+                "GAIT_IMU_PHASE_DISPLAY_MAX_GYRO_JUMP_DEG_S",
+                IMU_PHASE_DISPLAY_MAX_GYRO_JUMP_DEG_S,
+            ),
+        )
         self.imu_phase_left_swing_range_deg = 0.0
         self.imu_phase_right_swing_range_deg = 0.0
         self.imu_phase_diff_swing_range_deg = 0.0
@@ -513,6 +640,8 @@ class RealTimeGaitAnalysis(Node):
         self.imu_phase_diff_recent_swing_range_deg = 0.0
         self.imu_phase_left_frequency_hz = 0.0
         self.imu_phase_right_frequency_hz = 0.0
+        self.imu_phase_abnormal_sample = False
+        self.imu_phase_abnormal_reason = ""
 
         self.model_phase_estimator = None
         self.model_phase_output = None
@@ -1747,6 +1876,7 @@ class RealTimeGaitAnalysis(Node):
                                 if mode_key in (*DUAL_IMU_PHASE_MODES, *SINGLE_IMU_PHASE_MODES):
                                     self.imu_phase_swing_threshold = float(param_value)
                                     self.imu_phase_left_estimator.update_swing_threshold(param_value)
+                                    self.imu_phase_left_quaternion_estimator.update_swing_threshold(param_value)
                                     self.imu_phase_right_estimator.update_swing_threshold(param_value)
                                     self.imu_phase_diff_estimator.update_swing_threshold(param_value)
                                     effect = "当前模式已生效" if self.current_motion_mode == mode_key else "切换到该模式后生效"
@@ -1850,6 +1980,7 @@ class RealTimeGaitAnalysis(Node):
                 )
                 self.imu_phase_swing_threshold = threshold
                 self.imu_phase_left_estimator.update_swing_threshold(threshold)
+                self.imu_phase_left_quaternion_estimator.update_swing_threshold(threshold)
                 self.imu_phase_right_estimator.update_swing_threshold(threshold)
                 self.imu_phase_diff_estimator.update_swing_threshold(threshold)
                 source_text = str(getattr(self, "imu_phase_source_label", "大腿IMU"))
@@ -2069,7 +2200,83 @@ class RealTimeGaitAnalysis(Node):
 
     def _wrap_to_2pi(self, angle):
         """将角度环绕到 [0, 2π)"""
-        return angle % (2 * np.pi)
+        try:
+            value = float(angle)
+        except Exception:
+            return 0.0
+        if not math.isfinite(value):
+            return 0.0
+        return value % (2 * np.pi)
+
+    def _set_current_phase_pair(self, left_phase, right_phase=None):
+        """统一维护内部相位状态，避免 APP 或日志看到越界相位。"""
+        left = self._wrap_to_2pi(left_phase)
+        right_source = left + np.pi if right_phase is None else right_phase
+        right = self._wrap_to_2pi(right_source)
+        self.current_left_phase = left
+        self.current_right_phase = right
+        self.phi_L = left
+        return left, right
+
+    def _finite_or_default(self, value, default=0.0):
+        try:
+            result = float(value)
+        except Exception:
+            return float(default)
+        if not math.isfinite(result):
+            return float(default)
+        return result
+
+    def _imu_phase_display_limit(self, side: str, kind: str) -> float:
+        estimator = getattr(self, f"imu_phase_{side}_estimator", None)
+        config = getattr(estimator, "config", None)
+        if kind == "gyro":
+            default = 800.0 if side != "diff" else 1600.0
+            return max(0.0, float(getattr(config, "max_abs_gyro_deg_s", default)))
+        default = 170.0 if side != "diff" else 220.0
+        return max(0.0, float(getattr(config, "max_abs_angle_deg", default)))
+
+    def _sanitize_imu_phase_display_value(
+        self,
+        side: str,
+        kind: str,
+        value,
+        *,
+        hold_previous: bool = False,
+    ) -> float:
+        safe_attr = f"imu_phase_{side}_safe_{kind}"
+        initialized_attr = f"{safe_attr}_initialized"
+        fallback = self._finite_or_default(getattr(self, safe_attr, 0.0), 0.0)
+        if hold_previous:
+            return fallback
+        result = self._finite_or_default(value, fallback)
+        limit = self._imu_phase_display_limit(side, kind)
+        if limit > 0.0 and abs(result) > limit:
+            return fallback
+        initialized = bool(getattr(self, initialized_attr, False))
+        if kind == "gyro":
+            jump_limit = float(
+                getattr(
+                    self,
+                    "imu_phase_display_max_gyro_jump_deg_s",
+                    IMU_PHASE_DISPLAY_MAX_GYRO_JUMP_DEG_S,
+                )
+            )
+        else:
+            jump_limit = float(
+                getattr(
+                    self,
+                    "imu_phase_display_max_angle_jump_deg",
+                    IMU_PHASE_DISPLAY_MAX_ANGLE_JUMP_DEG,
+                )
+            )
+            if side == "diff":
+                jump_limit *= 2.0
+        if initialized and jump_limit > 0.0 and abs(result - fallback) > jump_limit:
+            return fallback
+        setattr(self, safe_attr, result)
+        setattr(self, initialized_attr, True)
+        return result
 
     def _clear_start_phase_init(self):
         """清除停止->行走起步相位初始化请求。"""
@@ -2104,9 +2311,7 @@ class RealTimeGaitAnalysis(Node):
         self._phase_peak_prev_phase = None
         self._phase_peak_prev_time = None
         self._assist_zero_prev_phase = init_phase
-        self.phi_L = init_phase
-        self.current_left_phase = init_phase
-        self.current_right_phase = self._wrap_to_2pi(init_phase + np.pi)
+        self._set_current_phase_pair(init_phase)
 
         side_cn = "左脚" if start_side == "left" else "右脚"
         self.get_logger().info(
@@ -2792,6 +2997,8 @@ class RealTimeGaitAnalysis(Node):
         self._reset_diff_test_motor_angle_filter()
         if hasattr(self, "imu_phase_left_estimator"):
             self.imu_phase_left_estimator.reset()
+        if hasattr(self, "imu_phase_left_quaternion_estimator"):
+            self.imu_phase_left_quaternion_estimator.reset()
         if hasattr(self, "imu_phase_right_estimator"):
             self.imu_phase_right_estimator.reset()
         if hasattr(self, "imu_phase_diff_estimator"):
@@ -2820,6 +3027,18 @@ class RealTimeGaitAnalysis(Node):
         self.imu_phase_right_angular_velocity_deg_s = 0.0
         self.imu_phase_diff_angle_deg = 0.0
         self.imu_phase_diff_angular_velocity_deg_s = 0.0
+        self.imu_phase_left_safe_angle = 0.0
+        self.imu_phase_right_safe_angle = 0.0
+        self.imu_phase_diff_safe_angle = 0.0
+        self.imu_phase_left_safe_gyro = 0.0
+        self.imu_phase_right_safe_gyro = 0.0
+        self.imu_phase_diff_safe_gyro = 0.0
+        self.imu_phase_left_safe_angle_initialized = False
+        self.imu_phase_right_safe_angle_initialized = False
+        self.imu_phase_diff_safe_angle_initialized = False
+        self.imu_phase_left_safe_gyro_initialized = False
+        self.imu_phase_right_safe_gyro_initialized = False
+        self.imu_phase_diff_safe_gyro_initialized = False
         self.imu_phase_left_swing_range_deg = 0.0
         self.imu_phase_right_swing_range_deg = 0.0
         self.imu_phase_diff_swing_range_deg = 0.0
@@ -2828,9 +3047,17 @@ class RealTimeGaitAnalysis(Node):
         self.imu_phase_diff_recent_swing_range_deg = 0.0
         self.imu_phase_left_frequency_hz = 0.0
         self.imu_phase_right_frequency_hz = 0.0
+        self.imu_phase_abnormal_sample = False
+        self.imu_phase_abnormal_reason = ""
         self.imu_phase_left_ao_last_time = None
         self.imu_phase_right_ao_last_time = None
         self.imu_phase_diff_ao_last_time = None
+        self.imu_phase_left_ao_last_phase_rad = None
+        self.imu_phase_right_ao_last_phase_rad = None
+        self.imu_phase_diff_ao_last_phase_rad = None
+        self.imu_phase_left_ao_last_phase_time = None
+        self.imu_phase_right_ao_last_phase_time = None
+        self.imu_phase_diff_ao_last_phase_time = None
         self.imu_phase_left_ao_zero_event_count = 0
         self.imu_phase_right_ao_zero_event_count = 0
         self.imu_phase_diff_ao_zero_event_count = 0
@@ -3108,9 +3335,10 @@ class RealTimeGaitAnalysis(Node):
         self.test_mode_right_phase_valid = bool(result.get("right_valid", False))
         self.test_mode_left_assist_ready = bool(result.get("left_assist_ready", False))
         self.test_mode_right_assist_ready = bool(result.get("right_assist_ready", False))
-        self.current_left_phase = self._wrap_to_2pi(float(result.get("left_phase_rad", 0.0)))
-        self.current_right_phase = self._wrap_to_2pi(float(result.get("right_phase_rad", np.pi)))
-        self.phi_L = self.current_left_phase
+        self._set_current_phase_pair(
+            result.get("left_phase_rad", 0.0),
+            result.get("right_phase_rad", np.pi),
+        )
         self.phase_active = bool(result.get("phase_active", False))
         self._update_phase_rate_frequency(self.current_left_phase)
         self._update_phase_peak_frequency(self.current_left_phase)
@@ -3163,9 +3391,10 @@ class RealTimeGaitAnalysis(Node):
         self.test_mode_right_phase_valid = bool(result.get("right_valid", False))
         self.test_mode_left_assist_ready = bool(result.get("left_assist_ready", False))
         self.test_mode_right_assist_ready = bool(result.get("right_assist_ready", False))
-        self.current_left_phase = float(result.get("left_phase_rad", 0.0))
-        self.current_right_phase = float(result.get("right_phase_rad", 0.0))
-        self.phi_L = self.current_left_phase
+        self._set_current_phase_pair(
+            result.get("left_phase_rad", 0.0),
+            result.get("right_phase_rad", 0.0),
+        )
         self.phase_active = bool(result.get("phase_active", False))
         self._update_phase_rate_frequency(self.current_left_phase)
         self._update_phase_peak_frequency(self.current_left_phase)
@@ -3197,6 +3426,9 @@ class RealTimeGaitAnalysis(Node):
         estimator: ThighImuPhaseEstimator,
     ) -> ImuPhaseOutput:
         """Run one side's IMU sagittal-angle signal through its own RAO."""
+        if bool(getattr(signal_output, "sample_rejected", False)):
+            return signal_output
+
         osc = getattr(self, f"imu_phase_{side}_adaptive_oscillator", None)
         if osc is None:
             raise RuntimeError(f"IMU AO oscillator unavailable for {side}")
@@ -3216,8 +3448,29 @@ class RealTimeGaitAnalysis(Node):
         phase_rad = osc.step(angle_rad, angular_velocity_rad_s)
         phase_offset = float(getattr(estimator.config, "phase_offset", 0.0))
         phase_rad = self._wrap_to_2pi(phase_rad + phase_offset * 2.0 * np.pi)
-
         zero_event = bool(getattr(osc, "last_zero_cross_event", False))
+        phase_limited = False
+        phase_rate_limit_hz = float(getattr(estimator.config, "max_phase_rate_hz", 0.0))
+        last_phase_attr = f"imu_phase_{side}_ao_last_phase_rad"
+        last_phase_time_attr = f"imu_phase_{side}_ao_last_phase_time"
+        last_phase = getattr(self, last_phase_attr, None)
+        last_phase_time = getattr(self, last_phase_time_attr, None)
+        if (
+            phase_rate_limit_hz > 0.0
+            and last_phase is not None
+            and last_phase_time is not None
+            and not zero_event
+        ):
+            phase_dt = float(sample_time) - float(last_phase_time)
+            if 0.0 < phase_dt <= 0.25:
+                max_delta = 2.0 * np.pi * phase_rate_limit_hz * phase_dt
+                forward_delta = (float(phase_rad) - float(last_phase)) % (2.0 * np.pi)
+                if forward_delta > max_delta:
+                    phase_rad = self._wrap_to_2pi(float(last_phase) + max_delta)
+                    phase_limited = True
+        setattr(self, last_phase_attr, float(phase_rad))
+        setattr(self, last_phase_time_attr, float(sample_time))
+
         zero_count_attr = f"imu_phase_{side}_ao_zero_event_count"
         zero_count = int(getattr(self, zero_count_attr, 0))
         if zero_event:
@@ -3233,7 +3486,10 @@ class RealTimeGaitAnalysis(Node):
         period_sec = 1.0 / max(freq_hz, 1e-6)
 
         recent_swing_active = bool(getattr(signal_output, "recent_swing_active", False))
-        motion_active = bool(signal_output.motion_active or (zero_count > 0 and recent_swing_active))
+        motion_active = bool(
+            not phase_limited
+            and (signal_output.motion_active or (zero_count > 0 and recent_swing_active))
+        )
 
         return ImuPhaseOutput(
             angle_raw_deg=signal_output.angle_raw_deg,
@@ -3256,6 +3512,7 @@ class RealTimeGaitAnalysis(Node):
                 signal_output.current_swing_range_deg,
             ),
             recent_swing_active=recent_swing_active,
+            phase_limited=phase_limited,
         )
 
     def _apply_seeded_imu_diff_phase(self, signal_output: ImuPhaseOutput, sample_time: float) -> ImuPhaseOutput:
@@ -3318,11 +3575,25 @@ class RealTimeGaitAnalysis(Node):
         if output is None:
             return None
 
-        setattr(self, f"imu_phase_{side}_angle_deg", float(output.angle_deg))
+        sample_rejected = bool(getattr(output, "sample_rejected", False))
+        reject_reason = str(getattr(output, "reject_reason", "") or "")
+        display_angle = self._sanitize_imu_phase_display_value(
+            side,
+            "angle",
+            output.angle_deg,
+            hold_previous=sample_rejected,
+        )
+        display_gyro = self._sanitize_imu_phase_display_value(
+            side,
+            "gyro",
+            output.angular_velocity_deg_s,
+            hold_previous=sample_rejected,
+        )
+        setattr(self, f"imu_phase_{side}_angle_deg", display_angle)
         setattr(
             self,
             f"imu_phase_{side}_angular_velocity_deg_s",
-            float(output.angular_velocity_deg_s),
+            display_gyro,
         )
         setattr(self, f"imu_phase_{side}_swing_range_deg", float(output.current_swing_range_deg))
         setattr(
@@ -3331,9 +3602,11 @@ class RealTimeGaitAnalysis(Node):
             float(getattr(output, "recent_swing_range_deg", output.current_swing_range_deg)),
         )
         setattr(self, f"imu_phase_{side}_frequency_hz", float(output.previous_cycle_frequency_hz))
-        setattr(self, f"imu_phase_{side}_valid", bool(output.zero_event_count > 0))
-        setattr(self, f"imu_phase_{side}_motion_active", bool(output.motion_active))
-        setattr(self, f"imu_phase_{side}_zero_event", bool(is_new_sample and output.zero_event))
+        setattr(self, f"imu_phase_{side}_sample_rejected", sample_rejected)
+        setattr(self, f"imu_phase_{side}_reject_reason", reject_reason)
+        setattr(self, f"imu_phase_{side}_valid", bool(output.zero_event_count > 0 and not sample_rejected))
+        setattr(self, f"imu_phase_{side}_motion_active", bool(output.motion_active and not sample_rejected))
+        setattr(self, f"imu_phase_{side}_zero_event", bool(is_new_sample and output.zero_event and not sample_rejected))
         return output
 
     def _extract_imu_phase(self):
@@ -3341,10 +3614,13 @@ class RealTimeGaitAnalysis(Node):
         ao_phase_mode = self.current_motion_mode in IMU_AO_PHASE_MODES
         single_imu_mode = self.current_motion_mode in SINGLE_IMU_PHASE_MODES
         dual_diff_mode = self.current_motion_mode in DUAL_IMU_PHASE_MODES
+        left_estimator = self.imu_phase_left_estimator
+        if self.current_motion_mode == "imu_left_phase":
+            left_estimator = self.imu_phase_left_quaternion_estimator
         left_output = self._process_imu_phase_side(
             "left",
             getattr(self, "imu_phase_left_detector", None),
-            self.imu_phase_left_estimator,
+            left_estimator,
             use_adaptive_oscillator=bool(ao_phase_mode and single_imu_mode),
         )
         right_output = None if single_imu_mode else self._process_imu_phase_side(
@@ -3353,12 +3629,25 @@ class RealTimeGaitAnalysis(Node):
             self.imu_phase_right_estimator,
             use_adaptive_oscillator=False,
         )
+        left_rejected = bool(left_output is not None and getattr(left_output, "sample_rejected", False))
+        right_rejected = bool(right_output is not None and getattr(right_output, "sample_rejected", False))
+        abnormal_reasons = []
+        if left_rejected:
+            abnormal_reasons.append(f"L:{getattr(left_output, 'reject_reason', '')}")
+        if right_rejected:
+            abnormal_reasons.append(f"R:{getattr(right_output, 'reject_reason', '')}")
 
         diff_output = None
         diff_new_sample = False
         diff_angle_raw_deg = 0.0
         diff_gyro_raw_deg_s = 0.0
-        if dual_diff_mode and left_output is not None and right_output is not None:
+        if (
+            dual_diff_mode
+            and left_output is not None
+            and right_output is not None
+            and not left_rejected
+            and not right_rejected
+        ):
             left_seq = int(getattr(self, "imu_phase_last_left_seq", 0))
             right_seq = int(getattr(self, "imu_phase_last_right_seq", 0))
             last_diff_left_seq = int(getattr(self, "imu_phase_last_diff_left_seq", 0))
@@ -3405,9 +3694,7 @@ class RealTimeGaitAnalysis(Node):
                         self._imu_diff_start_seeded = True
                         self._imu_diff_start_phase_rad = init_phase
                         self._imu_diff_start_time = float(diff_time)
-                        self.current_left_phase = init_phase
-                        self.current_right_phase = self._wrap_to_2pi(init_phase + np.pi)
-                        self.phi_L = self.current_left_phase
+                        self._set_current_phase_pair(init_phase)
                         if ao_phase_mode:
                             osc = getattr(self, "imu_phase_diff_adaptive_oscillator", None)
                             if osc is not None and hasattr(osc, "prime_phase"):
@@ -3439,21 +3726,32 @@ class RealTimeGaitAnalysis(Node):
                 self.imu_phase_diff_sample_time = float(diff_time)
                 self.imu_phase_diff_output = diff_output
                 diff_new_sample = True
+                if bool(getattr(diff_output, "sample_rejected", False)):
+                    abnormal_reasons.append(f"D:{getattr(diff_output, 'reject_reason', '')}")
+                    self.imu_phase_diff_output = None
+                    diff_output = None
+
+        if bool(diff_output is not None and getattr(diff_output, "sample_rejected", False)):
+            abnormal_reasons.append(f"D:{getattr(diff_output, 'reject_reason', '')}")
+            diff_output = None
 
         if dual_diff_mode:
+            diff_rejected = bool(abnormal_reasons)
             seeded_diff_valid = bool(
                 diff_output is not None
                 and self.gait_state == 1
                 and not ao_phase_mode
+                and not diff_rejected
                 and bool(getattr(self, "_imu_diff_start_seeded", False))
                 and int(getattr(diff_output, "zero_event_count", 0)) == 0
                 and bool(getattr(diff_output, "recent_swing_active", False))
             )
             diff_valid = bool(
                 diff_output is not None
+                and not diff_rejected
                 and (ao_phase_mode or diff_output.zero_event_count > 0 or seeded_diff_valid)
             )
-            diff_motion_active = bool(diff_output is not None and diff_output.motion_active)
+            diff_motion_active = bool(diff_output is not None and diff_output.motion_active and not diff_rejected)
             self.imu_phase_left_valid = diff_valid
             self.imu_phase_right_valid = diff_valid
             self.imu_phase_valid = diff_valid
@@ -3465,9 +3763,17 @@ class RealTimeGaitAnalysis(Node):
             )
             self.imu_phase_right_zero_event = False
             if diff_output is not None:
-                self.imu_phase_diff_angle_deg = float(diff_output.angle_deg)
-                self.imu_phase_diff_angular_velocity_deg_s = float(
-                    diff_output.angular_velocity_deg_s
+                self.imu_phase_diff_angle_deg = self._sanitize_imu_phase_display_value(
+                    "diff",
+                    "angle",
+                    diff_output.angle_deg,
+                    hold_previous=diff_rejected,
+                )
+                self.imu_phase_diff_angular_velocity_deg_s = self._sanitize_imu_phase_display_value(
+                    "diff",
+                    "gyro",
+                    diff_output.angular_velocity_deg_s,
+                    hold_previous=diff_rejected,
                 )
                 self.imu_phase_diff_swing_range_deg = float(diff_output.current_swing_range_deg)
                 self.imu_phase_diff_recent_swing_range_deg = float(
@@ -3477,21 +3783,20 @@ class RealTimeGaitAnalysis(Node):
                         diff_output.current_swing_range_deg,
                     )
                 )
-                self.current_left_phase = self._wrap_to_2pi(float(diff_output.phase_rad))
-                self.current_right_phase = self._wrap_to_2pi(self.current_left_phase + np.pi)
-                self.phi_L = self.current_left_phase
+                self._set_current_phase_pair(diff_output.phase_rad)
                 diff_freq = float(diff_output.previous_cycle_frequency_hz)
                 self.imu_phase_left_frequency_hz = diff_freq
                 self.imu_phase_right_frequency_hz = diff_freq
             else:
-                self.current_right_phase = self._wrap_to_2pi(self.current_left_phase + np.pi)
+                self._set_current_phase_pair(self.current_left_phase)
             left_valid = diff_valid
         else:
             left_valid = bool(
                 left_output is not None
+                and not left_rejected
                 and (ao_phase_mode or left_output.zero_event_count > 0)
             )
-            left_motion_active = bool(left_output is not None and left_output.motion_active)
+            left_motion_active = bool(left_output is not None and left_output.motion_active and not left_rejected)
             self.imu_phase_left_valid = left_valid
             self.imu_phase_right_valid = bool(left_valid if single_imu_mode else False)
             self.imu_phase_valid = bool(left_valid)
@@ -3510,10 +3815,20 @@ class RealTimeGaitAnalysis(Node):
                 self.imu_phase_right_frequency_hz = float(self.imu_phase_left_frequency_hz)
                 self.imu_phase_right_zero_event = False
 
-            if left_output is not None:
-                self.current_left_phase = self._wrap_to_2pi(float(left_output.phase_rad))
-                self.phi_L = self.current_left_phase
-            self.current_right_phase = self._wrap_to_2pi(self.current_left_phase + np.pi)
+            if left_output is not None and not left_rejected:
+                self._set_current_phase_pair(left_output.phase_rad)
+            else:
+                self._set_current_phase_pair(self.current_left_phase)
+
+        self.imu_phase_abnormal_sample = bool(abnormal_reasons)
+        self.imu_phase_abnormal_reason = ";".join(
+            reason for reason in abnormal_reasons if str(reason).strip()
+        )
+        if self.imu_phase_abnormal_sample:
+            self.imu_phase_valid = False
+            self.imu_phase_left_motion_active = False
+            self.imu_phase_right_motion_active = False
+            self.imu_phase_motion_active = False
 
         self.phase_active = bool(self.gait_state == 1 and self.imu_phase_valid)
         if self.phase_active:
@@ -3669,10 +3984,26 @@ class RealTimeGaitAnalysis(Node):
         self.model_phase_post_phase = float(output.phase_0_to_1)
         self.model_phase_stride_rate_hz = float(output.stride_rate_clamped_hz)
 
-        self.imu_phase_left_angle_deg = float(output.left_euler_y_deg)
-        self.imu_phase_right_angle_deg = float(output.right_euler_y_deg)
-        self.imu_phase_left_angular_velocity_deg_s = float(output.left_gyro_y_deg_s)
-        self.imu_phase_right_angular_velocity_deg_s = float(output.right_gyro_y_deg_s)
+        self.imu_phase_left_angle_deg = self._sanitize_imu_phase_display_value(
+            "left",
+            "angle",
+            output.left_euler_y_deg,
+        )
+        self.imu_phase_right_angle_deg = self._sanitize_imu_phase_display_value(
+            "right",
+            "angle",
+            output.right_euler_y_deg,
+        )
+        self.imu_phase_left_angular_velocity_deg_s = self._sanitize_imu_phase_display_value(
+            "left",
+            "gyro",
+            output.left_gyro_y_deg_s,
+        )
+        self.imu_phase_right_angular_velocity_deg_s = self._sanitize_imu_phase_display_value(
+            "right",
+            "gyro",
+            output.right_gyro_y_deg_s,
+        )
         self.imu_phase_left_swing_range_deg = 0.0
         self.imu_phase_right_swing_range_deg = 0.0
         self.imu_phase_left_recent_swing_range_deg = 0.0
@@ -3692,9 +4023,7 @@ class RealTimeGaitAnalysis(Node):
         self.imu_phase_left_zero_event = zero_event
         self.imu_phase_right_zero_event = False
 
-        self.current_left_phase = self._wrap_to_2pi(float(output.phase_rad))
-        self.current_right_phase = self._wrap_to_2pi(self.current_left_phase + np.pi)
-        self.phi_L = self.current_left_phase
+        self._set_current_phase_pair(output.phase_rad)
 
         self.phase_active = bool(self.gait_state == 1 and self.imu_phase_valid)
         if self.phase_active and bool(getattr(output, "is_new_prediction", True)):
@@ -3774,9 +4103,7 @@ class RealTimeGaitAnalysis(Node):
                 try:
                     if allow_preview_update:
                         phase_preview = self.adaptive_oscillator.step(angle_diff)
-                        self.phi_L = phase_preview
-                        self.current_left_phase = phase_preview
-                        self.current_right_phase = self._wrap_to_2pi(phase_preview + np.pi)
+                        self._set_current_phase_pair(phase_preview)
                     else:
                         self.adaptive_oscillator.run_filter_only(angle_diff)
                 except Exception:
@@ -3811,9 +4138,7 @@ class RealTimeGaitAnalysis(Node):
                 self.reset_phase_estimator()
                 return
 
-        self.phi_L = phase
-        self.current_left_phase = phase
-        self.current_right_phase = self._wrap_to_2pi(phase + np.pi)
+        self._set_current_phase_pair(phase)
         self.phase_active = True
         self._update_phase_rate_frequency(self.current_left_phase)
         self._update_phase_peak_frequency(self.current_left_phase)
@@ -3854,6 +4179,9 @@ class RealTimeGaitAnalysis(Node):
         
         # 检查相位是否已初始化
         if hasattr(self, 'current_left_phase') and hasattr(self, 'current_right_phase'):
+            self.current_left_phase = self._wrap_to_2pi(self.current_left_phase)
+            self.current_right_phase = self._wrap_to_2pi(self.current_right_phase)
+            self.phi_L = self.current_left_phase
             # 将相位从 0-2π 归一化到 0-1
             left_phase_normalized = self.current_left_phase / (2 * np.pi)
             right_phase_normalized = self.current_right_phase / (2 * np.pi)
@@ -3887,17 +4215,25 @@ class RealTimeGaitAnalysis(Node):
             self.current_motion_mode in IMU_PHASE_MODES
             and not bool(getattr(self, "imu_phase_motion_active", False))
         )
+        imu_phase_abnormal = (
+            self.current_motion_mode in IMU_PHASE_MODES
+            and bool(getattr(self, "imu_phase_abnormal_sample", False))
+        )
 
         # 运动检测/相位有效性：相位被置零、助力关闭或IMU相位未检测到真实运动时，不输出助力
         if (
             not self.assist_enable
             or not getattr(self, "phase_active", False)
             or imu_phase_motion_inactive
+            or imu_phase_abnormal
         ):
             left_torque = 0.0
             right_torque = 0.0
             if self.debug_mode and self.log_counter % 20 == 0:
                 reason = (
+                    "IMU相位异常样本"
+                    if imu_phase_abnormal
+                    else
                     "IMU相位静止/轻微摆动"
                     if imu_phase_motion_inactive
                     else "相位未激活或助力关闭"

@@ -567,6 +567,10 @@ class RealtimeOnnxGaitPhaseEstimator:
         values = values[:10]
         if not np.isfinite(values).all():
             raise ValueError(f"{side} MI1 sample contains non-finite values")
+        if float(np.linalg.norm(values[:3])) <= 1e-9:
+            raise ValueError(f"{side} MI1 sample has invalid zero acceleration")
+        if float(np.linalg.norm(values[6:10])) <= 1e-9:
+            raise ValueError(f"{side} MI1 sample has invalid zero quaternion")
         return values
 
     def _postprocess_phase(

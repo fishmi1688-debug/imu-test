@@ -11,6 +11,8 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.math.PI
+import kotlin.math.abs
 
 object GaitBluetoothBridge {
     private const val ENABLE_TELEMETRY_CSV_RECORDING = false
@@ -39,6 +41,13 @@ object GaitBluetoothBridge {
     private const val FLAG_IMU_READY = 14
     private const val FLAG_IMU_STALE = 15
     private const val FLAG_IMU_PHASE_MOTION_ACTIVE = 24
+    private const val MAX_PLOT_ANGLE_ABS = 360f
+    private const val MAX_PLOT_IMU_ANGLE_ABS = 170f
+    private const val MAX_PLOT_IMU_ANGLE_JUMP = 45f
+    private const val MAX_PLOT_VELOCITY_ABS = 2000f
+    private const val MAX_PLOT_IMU_VELOCITY_JUMP = 900f
+    private const val MAX_PLOT_ASSIST_ABS = 17f
+    private val TWO_PI = (2.0 * PI).toFloat()
 
     private val COMPACT_MODE_KEYS = listOf(
         "walking",
@@ -250,6 +259,9 @@ object GaitBluetoothBridge {
             "state" -> {
                 val snapshot = obj.toStateSnapshot() ?: return
                 synchronized(lock) {
+                    if (latestStateSnapshot?.motionMode != snapshot.motionMode) {
+                        latestPlotFrame = null
+                    }
                     latestStateSnapshot = snapshot
                 }
                 recorder?.onStateSnapshot(snapshot)
@@ -317,10 +329,108 @@ object GaitBluetoothBridge {
     }
 
     private fun acceptPlotFrame(frame: PlotFrame, recorder: GaitTelemetryCsvRecorder?) {
+        val safeFrame = sanitizePlotFrame(frame)
         synchronized(lock) {
-            latestPlotFrame = frame
+            latestPlotFrame = safeFrame
         }
-        recorder?.onPlotFrame(frame)
+        recorder?.onPlotFrame(safeFrame)
+    }
+
+    private fun sanitizePlotFrame(frame: PlotFrame): PlotFrame {
+        val (previous, stateSnapshot) = synchronized(lock) {
+            latestPlotFrame to latestStateSnapshot
+        }
+        val isImuPhaseMode = stateSnapshot?.motionMode in IMU_PHASE_MODE_KEYS ||
+            frame.leftAngularVelocity != null ||
+            frame.rightAngularVelocity != null ||
+            frame.rightAssist != null
+        val angleMaxAbs = if (isImuPhaseMode) MAX_PLOT_IMU_ANGLE_ABS else MAX_PLOT_ANGLE_ABS
+        val angleJump = if (isImuPhaseMode) MAX_PLOT_IMU_ANGLE_JUMP else 0f
+        val velocityJump = if (isImuPhaseMode) MAX_PLOT_IMU_VELOCITY_JUMP else 0f
+        return frame.copy(
+            leftAngle = finiteOrFallback(
+                frame.leftAngle,
+                previous?.leftAngle ?: 0f,
+                angleMaxAbs,
+                maxJump = angleJump,
+                rejectJump = previous != null,
+            ),
+            rightAngle = finiteOrFallback(
+                frame.rightAngle,
+                previous?.rightAngle ?: 0f,
+                angleMaxAbs,
+                maxJump = angleJump,
+                rejectJump = previous != null,
+            ),
+            angleDiff = finiteOrFallback(
+                frame.angleDiff,
+                previous?.angleDiff ?: 0f,
+                angleMaxAbs * 2f,
+                maxJump = angleJump * 2f,
+                rejectJump = previous != null,
+            ),
+            phase = normalizePhaseRad(frame.phase, previous?.phase ?: 0f),
+            assist = finiteOrFallback(
+                frame.assist,
+                previous?.assist ?: 0f,
+                MAX_PLOT_ASSIST_ABS,
+            ),
+            leftAngularVelocity = frame.leftAngularVelocity?.let {
+                finiteOrFallback(
+                    it,
+                    previous?.leftAngularVelocity ?: 0f,
+                    MAX_PLOT_VELOCITY_ABS,
+                    maxJump = velocityJump,
+                    rejectJump = previous?.leftAngularVelocity != null,
+                )
+            },
+            rightAngularVelocity = frame.rightAngularVelocity?.let {
+                finiteOrFallback(
+                    it,
+                    previous?.rightAngularVelocity ?: 0f,
+                    MAX_PLOT_VELOCITY_ABS,
+                    maxJump = velocityJump,
+                    rejectJump = previous?.rightAngularVelocity != null,
+                )
+            },
+            rightAssist = frame.rightAssist?.let {
+                finiteOrFallback(
+                    it,
+                    previous?.rightAssist ?: 0f,
+                    MAX_PLOT_ASSIST_ABS,
+                )
+            },
+        )
+    }
+
+    private fun finiteOrFallback(
+        value: Float,
+        fallback: Float,
+        maxAbs: Float,
+        maxJump: Float = 0f,
+        rejectJump: Boolean = false,
+    ): Float {
+        if (!value.isFinite()) {
+            return fallback
+        }
+        if (maxAbs > 0f && abs(value) > maxAbs) {
+            return fallback
+        }
+        if (rejectJump && maxJump > 0f && abs(value - fallback) > maxJump) {
+            return fallback
+        }
+        return value
+    }
+
+    private fun normalizePhaseRad(value: Float, fallback: Float): Float {
+        if (!value.isFinite()) {
+            return fallback
+        }
+        var wrapped = value % TWO_PI
+        if (wrapped < 0f) {
+            wrapped += TWO_PI
+        }
+        return wrapped
     }
 
     private fun dispatchRawLine(line: String) {

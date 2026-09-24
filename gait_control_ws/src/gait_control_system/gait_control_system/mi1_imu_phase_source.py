@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import errno
+import math
 import os
 import socket
 import struct
@@ -22,7 +23,13 @@ DEFAULT_RIGHT_NODE_ID = 0x02
 DEFAULT_PROTOCOL = "auto"
 DEFAULT_DATA_TIMEOUT_SEC = 0.5
 DEFAULT_MAX_FIELD_AGE_SEC = 0.15
+DEFAULT_MAX_FIELD_SPAN_SEC = 0.10
 DEFAULT_EXPECTED_RATE_HZ = 50.0
+DEFAULT_MIN_ACCEL_NORM_G = 0.20
+DEFAULT_MAX_ACCEL_NORM_G = 6.00
+DEFAULT_MIN_QUAT_NORM = 0.50
+DEFAULT_MAX_QUAT_NORM = 1.50
+DEFAULT_MAX_GYRO_DPS = 800.0
 
 CAN_FRAME_FORMAT = "=IB3x8s"
 CAN_FRAME_SIZE = struct.calcsize(CAN_FRAME_FORMAT)
@@ -105,18 +112,28 @@ class ImuState:
     def is_complete(self) -> bool:
         return self.accel_g is not None and self.gyro_dps is not None and self.quat is not None
 
-    def is_fresh(self, now: float, max_age_sec: float) -> bool:
+    def is_fresh(self, now: float, max_age_sec: float, max_span_sec: float = 0.0) -> bool:
         if not self.is_complete():
             return False
+        field_times = [self.updated_at.get(name, -1e30) for name in ("accel", "gyro", "quat")]
         if max_age_sec <= 0.0:
-            return True
-        return all(
-            now - self.updated_at.get(name, -1e30) <= max_age_sec
-            for name in ("accel", "gyro", "quat")
-        )
+            age_ok = True
+        else:
+            age_ok = all(now - field_time <= max_age_sec for field_time in field_times)
+        if not age_ok:
+            return False
+        if max_span_sec > 0.0 and max(field_times) - min(field_times) > max_span_sec:
+            return False
+        return True
 
-    def has_new_complete_sample(self, now: float, max_age_sec: float, last_counts: dict[str, int]) -> bool:
-        if not self.is_fresh(now, max_age_sec):
+    def has_new_complete_sample(
+        self,
+        now: float,
+        max_age_sec: float,
+        max_span_sec: float,
+        last_counts: dict[str, int],
+    ) -> bool:
+        if not self.is_fresh(now, max_age_sec, max_span_sec):
             return False
         return all(
             self.frame_counts.get(name, 0) > last_counts.get(name, 0)
@@ -341,10 +358,41 @@ class WiredMi1CanImuPhaseSource:
                 0.0,
             )
         )
+        self.max_field_span_sec = _read_env_float(
+            "GAIT_MI1_MAX_FIELD_SPAN_SEC",
+            DEFAULT_MAX_FIELD_SPAN_SEC,
+            0.0,
+        )
         self.sample_rate_hz = _read_env_float(
             "GAIT_IMU_PHASE_MI1_RATE_HZ",
             DEFAULT_EXPECTED_RATE_HZ,
             1.0,
+        )
+        self.reject_invalid_samples = _env_enabled("GAIT_MI1_REJECT_INVALID_SAMPLES", True)
+        self.min_accel_norm_g = _read_env_float(
+            "GAIT_MI1_MIN_ACCEL_NORM_G",
+            DEFAULT_MIN_ACCEL_NORM_G,
+            0.0,
+        )
+        self.max_accel_norm_g = _read_env_float(
+            "GAIT_MI1_MAX_ACCEL_NORM_G",
+            DEFAULT_MAX_ACCEL_NORM_G,
+            0.0,
+        )
+        self.min_quat_norm = _read_env_float(
+            "GAIT_MI1_MIN_QUAT_NORM",
+            DEFAULT_MIN_QUAT_NORM,
+            0.0,
+        )
+        self.max_quat_norm = _read_env_float(
+            "GAIT_MI1_MAX_QUAT_NORM",
+            DEFAULT_MAX_QUAT_NORM,
+            0.0,
+        )
+        self.max_gyro_dps = _read_env_float(
+            "GAIT_MI1_MAX_GYRO_DPS",
+            DEFAULT_MAX_GYRO_DPS,
+            0.0,
         )
         self.mac_address = self._make_source_id()
 
@@ -504,6 +552,37 @@ class WiredMi1CanImuPhaseSource:
         if filter_blob:
             sock.setsockopt(sol_can_raw, can_raw_filter, filter_blob)
 
+    def _invalid_sample_reason(
+        self,
+        sample: tuple[float, float, float, float, float, float, float, float, float, float],
+    ) -> str:
+        if not self.reject_invalid_samples:
+            return ""
+        if not all(math.isfinite(value) for value in sample):
+            return "non_finite"
+
+        acc_norm = math.sqrt(sample[0] * sample[0] + sample[1] * sample[1] + sample[2] * sample[2])
+        if self.min_accel_norm_g > 0.0 and acc_norm < self.min_accel_norm_g:
+            return f"acc_norm<{self.min_accel_norm_g:.2f}g"
+        if self.max_accel_norm_g > 0.0 and acc_norm > self.max_accel_norm_g:
+            return f"acc_norm>{self.max_accel_norm_g:.2f}g"
+
+        max_abs_gyro = max(abs(sample[3]), abs(sample[4]), abs(sample[5]))
+        if self.max_gyro_dps > 0.0 and max_abs_gyro > self.max_gyro_dps:
+            return f"gyro_abs>{self.max_gyro_dps:.1f}dps"
+
+        quat_norm = math.sqrt(
+            sample[6] * sample[6]
+            + sample[7] * sample[7]
+            + sample[8] * sample[8]
+            + sample[9] * sample[9]
+        )
+        if self.min_quat_norm > 0.0 and quat_norm < self.min_quat_norm:
+            return f"quat_norm<{self.min_quat_norm:.2f}"
+        if self.max_quat_norm > 0.0 and quat_norm > self.max_quat_norm:
+            return f"quat_norm>{self.max_quat_norm:.2f}"
+        return ""
+
     def _read_loop(self) -> None:
         while not self._stop_event.is_set():
             with self._lock:
@@ -547,11 +626,18 @@ class WiredMi1CanImuPhaseSource:
         if not self._state.has_new_complete_sample(
             float(arrival_time),
             self.max_field_age_sec,
+            self.max_field_span_sec,
             self._last_emitted_counts,
         ):
             return
 
         sample = self._state.to_phase_sample()
+        invalid_reason = self._invalid_sample_reason(sample)
+        if invalid_reason:
+            self._state.mark_sample_emitted(self._last_emitted_counts)
+            self._last_error = f"MI1 invalid sample: {invalid_reason}"
+            return
+
         self._state.mark_sample_emitted(self._last_emitted_counts)
         with self._lock:
             self._seq += 1
