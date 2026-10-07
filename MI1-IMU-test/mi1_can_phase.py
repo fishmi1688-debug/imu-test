@@ -57,7 +57,7 @@ DEFAULT_MIN_PHASE_ANGLE_RANGE_DEG = 25.0
 DEFAULT_COMPLEMENTARY_ACC_WEIGHT = 0.02
 DEFAULT_ANGLE_SIGN = -1.0
 DEFAULT_GYRO_SIGN = 1.0
-DEFAULT_ANGLE_SOURCE = "quat_y"
+DEFAULT_ANGLE_SOURCE = "acc"
 DEFAULT_ACC_LONG_AXIS = "x"
 DEFAULT_ACC_SAGITTAL_AXIS = "z"
 DEFAULT_GYRO_AXIS = "y"
@@ -140,31 +140,42 @@ class ImuState:
         self.updated_at[decoded.signal_name] = now
         self.frame_counts[decoded.signal_name] = self.frame_counts.get(decoded.signal_name, 0) + 1
 
-    def is_complete(self) -> bool:
-        return self.accel_g is not None and self.gyro_dps is not None and self.quat is not None
+    @staticmethod
+    def required_fields(require_quaternion: bool) -> tuple[str, ...]:
+        return ("accel", "gyro", "quat") if require_quaternion else ("accel", "gyro")
 
-    def is_fresh(self, now: float, max_age_sec: float) -> bool:
-        if not self.is_complete():
+    def is_complete(self, require_quaternion: bool = False) -> bool:
+        quat_ready = self.quat is not None or not require_quaternion
+        return self.accel_g is not None and self.gyro_dps is not None and quat_ready
+
+    def is_fresh(self, now: float, max_age_sec: float, require_quaternion: bool = False) -> bool:
+        if not self.is_complete(require_quaternion=require_quaternion):
             return False
         if max_age_sec <= 0.0:
             return True
-        return all(now - self.updated_at.get(name, -math.inf) <= max_age_sec for name in ("accel", "gyro", "quat"))
+        return all(
+            now - self.updated_at.get(name, -math.inf) <= max_age_sec
+            for name in self.required_fields(require_quaternion)
+        )
 
     def available_fields_text(self) -> str:
         fields = [name for name in ("accel", "gyro", "quat") if self.frame_counts.get(name, 0) > 0]
         return "+".join(fields) if fields else "none"
 
-    def to_sample(self, role: str, now: float) -> "ImuSample":
-        if self.accel_g is None or self.gyro_dps is None or self.quat is None:
-            raise ValueError("cannot build sample from incomplete IMU state")
+    def to_sample(self, role: str, now: float, require_quaternion: bool = False) -> "ImuSample":
+        if self.accel_g is None or self.gyro_dps is None:
+            raise ValueError("cannot build sample from incomplete accel/gyro state")
+        if require_quaternion and self.quat is None:
+            raise ValueError("cannot build sample from incomplete quaternion state")
+        quat = self.quat or Quat(float("nan"), float("nan"), float("nan"), float("nan"))
         return ImuSample(
             role=role,
             node_id=self.node_id,
             arrival_time=now,
-            quat_w=self.quat.w,
-            quat_x=self.quat.x,
-            quat_y=self.quat.y,
-            quat_z=self.quat.z,
+            quat_w=quat.w,
+            quat_x=quat.x,
+            quat_y=quat.y,
+            quat_z=quat.z,
             acc_x=self.accel_g.x,
             acc_y=self.accel_g.y,
             acc_z=self.accel_g.z,
@@ -271,23 +282,60 @@ class FirstOrderLowpass:
         return self.value
 
 
+def wrap_angle_degrees(value: float) -> float:
+    return ((float(value) + 180.0) % 360.0) - 180.0
+
+
+def shortest_angle_delta_degrees(current: float, previous: float) -> float:
+    return wrap_angle_degrees(float(current) - float(previous))
+
+
+class WrappedAngleLowpass:
+    def __init__(self, cutoff_hz: float):
+        self.cutoff_hz = float(cutoff_hz)
+        self.value_deg: Optional[float] = None
+        self.time_sec: Optional[float] = None
+
+    def reset(self) -> None:
+        self.value_deg = None
+        self.time_sec = None
+
+    def update(self, value: float, time_sec: float) -> float:
+        current = wrap_angle_degrees(value)
+        if self.value_deg is None or self.time_sec is None or self.cutoff_hz <= 0.0:
+            self.value_deg = current
+            self.time_sec = float(time_sec)
+            return current
+
+        dt = max(0.0, float(time_sec) - self.time_sec)
+        if dt <= EPSILON:
+            return self.value_deg
+
+        tau = 1.0 / (2.0 * math.pi * self.cutoff_hz)
+        alpha = dt / (tau + dt)
+        delta = shortest_angle_delta_degrees(current, self.value_deg)
+        self.value_deg = wrap_angle_degrees(self.value_deg + alpha * delta)
+        self.time_sec = float(time_sec)
+        return self.value_deg
+
+
 class ThighPhaseEstimator:
     """Sagittal thigh phase estimator.
 
-    Matches the imu_gait_UART phase pipeline: the caller selects the angle
-    source and gyroscope axis first, then this estimator filters the selected
-    angle/velocity and turns repeated zero events into gait phase.
+    The caller selects the angle source and gyroscope axis first, then this
+    estimator filters the selected angle/velocity and turns repeated zero
+    events into gait phase. The angle filter uses shortest-path wrapped
+    deltas so +180/-180 deg boundary crossings are not treated as large jumps.
 
     Default MI1 mounting convention:
     X points upward along the thigh, Y points to the user's left side, and
-    Z points forward. With the default config this uses quaternion Euler Y and
-    +gyro_y. The acceleration fallback is -atan2(acc_z, acc_x), so standing is
-    close to 0 deg when gravity is aligned with the thigh X axis.
+    Z points forward. With the default config the angle is the accelerometer
+    gravity projection atan2(acc_z, acc_x), and angular velocity is +gyro_y.
     """
 
     def __init__(self, config: PhaseEstimatorConfig):
         self.config = config
-        self.angle_filter = FirstOrderLowpass(config.lowpass_cutoff_hz)
+        self.angle_filter = WrappedAngleLowpass(config.lowpass_cutoff_hz)
         self.gyro_filter = FirstOrderLowpass(config.lowpass_cutoff_hz)
         self.start_time: Optional[float] = None
         self.current_cycle_start_time: Optional[float] = None
@@ -337,9 +385,12 @@ class ThighPhaseEstimator:
             self.current_cycle_start_time = sample.arrival_time
 
         time_sec = sample.arrival_time
-        angle_acc = self.angle_filter.update(phase_inputs.angle_used_deg, time_sec)
+        angle_filtered = self.angle_filter.update(phase_inputs.angle_used_deg, time_sec)
         gyro = self.gyro_filter.update(phase_inputs.gyro_used_deg_s, time_sec)
-        angle = self._update_complementary_angle(angle_acc, gyro, time_sec)
+        if str(self.config.angle_source).strip().lower().startswith("quat"):
+            angle = self._update_complementary_angle(angle_filtered, gyro, time_sec)
+        else:
+            angle = angle_filtered
 
         self._append_recent_angle(time_sec, angle)
         self._update_cycle_extrema(time_sec, angle)
@@ -392,8 +443,9 @@ class ThighPhaseEstimator:
             return self.complementary_angle
 
         acc_weight = clamp(self.config.complementary_acc_weight, 0.0, 1.0)
-        predicted = self.complementary_angle + gyro_deg_s * dt
-        self.complementary_angle = (1.0 - acc_weight) * predicted + acc_weight * acc_angle_deg
+        predicted = wrap_angle_degrees(self.complementary_angle + gyro_deg_s * dt)
+        correction = shortest_angle_delta_degrees(acc_angle_deg, predicted)
+        self.complementary_angle = wrap_angle_degrees(predicted + acc_weight * correction)
         self.complementary_time = time_sec
         return self.complementary_angle
 
@@ -644,7 +696,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--angle-source",
         choices=("acc", "quat_x", "quat_y", "quat_z"),
         default=DEFAULT_ANGLE_SOURCE,
-        help="Angle used for phase; acc uses atan2(acc_sagittal_axis, acc_long_axis), default: quat_y",
+        help="Angle used for phase; acc uses atan2(acc_sagittal_axis, acc_long_axis), default: acc",
     )
     parser.add_argument(
         "--acc-long-axis",
@@ -968,14 +1020,22 @@ def has_new_complete_sample(
     now: float,
     max_age_sec: float,
     last_counts: dict[str, int],
+    require_quaternion: bool = False,
 ) -> bool:
-    if not state.is_fresh(now, max_age_sec):
+    if not state.is_fresh(now, max_age_sec, require_quaternion=require_quaternion):
         return False
-    return all(state.frame_counts.get(name, 0) > last_counts.get(name, 0) for name in ("accel", "gyro", "quat"))
+    return all(
+        state.frame_counts.get(name, 0) > last_counts.get(name, 0)
+        for name in ImuState.required_fields(require_quaternion)
+    )
 
 
-def mark_sample_emitted(state: ImuState, last_counts: dict[str, int]) -> None:
-    for name in ("accel", "gyro", "quat"):
+def mark_sample_emitted(
+    state: ImuState,
+    last_counts: dict[str, int],
+    require_quaternion: bool = False,
+) -> None:
+    for name in ImuState.required_fields(require_quaternion):
         last_counts[name] = state.frame_counts.get(name, 0)
 
 
@@ -1127,6 +1187,8 @@ def run_loop(args: argparse.Namespace, sock: socket.socket) -> int:
     role_nodes = [("left", args.left_id), ("right", args.right_id)]
     target_nodes = {node_id for _role, node_id in role_nodes}
     states = {node_id: ImuState(node_id) for _role, node_id in role_nodes}
+    require_quaternion = str(args.angle_source).strip().lower().startswith("quat")
+    required_signal_text = "accel/gyro/quat" if require_quaternion else "accel/gyro"
     phase_configs = {role: phase_config_for_role(args, role) for role, _node in role_nodes}
     estimators = {role: ThighPhaseEstimator(phase_configs[role]) for role, _node in role_nodes}
     last_emitted_counts = {node_id: {"accel": 0, "gyro": 0, "quat": 0} for _role, node_id in role_nodes}
@@ -1169,7 +1231,13 @@ def run_loop(args: argparse.Namespace, sock: socket.socket) -> int:
                 continue
 
             have_new_data = all(
-                has_new_complete_sample(states[node_id], now, args.max_age, last_emitted_counts[node_id])
+                has_new_complete_sample(
+                    states[node_id],
+                    now,
+                    args.max_age,
+                    last_emitted_counts[node_id],
+                    require_quaternion=require_quaternion,
+                )
                 for _role, node_id in role_nodes
             )
             if have_new_data:
@@ -1178,12 +1246,12 @@ def run_loop(args: argparse.Namespace, sock: socket.socket) -> int:
                 processed_by_role = {}
                 for role, node_id in role_nodes:
                     state = states[node_id]
-                    sample = state.to_sample(role, now)
+                    sample = state.to_sample(role, now, require_quaternion=require_quaternion)
                     phase_inputs = phase_inputs_from_sample(sample, phase_configs[role])
                     processed = estimators[role].process(sample, phase_inputs)
                     processed_by_role[role] = processed
                     row.extend(format_role_output(state, sample, processed))
-                    mark_sample_emitted(state, last_emitted_counts[node_id])
+                    mark_sample_emitted(state, last_emitted_counts[node_id], require_quaternion=require_quaternion)
                 if not args.no_stdout:
                     print(",".join(row), flush=True)
                 if csv_writer is not None:
@@ -1196,7 +1264,7 @@ def run_loop(args: argparse.Namespace, sock: socket.socket) -> int:
                 output_count += 1
             elif now - last_status >= 1.0:
                 print(
-                    f"Waiting for new complete MI1 accel/gyro/quat data: {status_text(states, role_nodes)}",
+                    f"Waiting for new complete MI1 {required_signal_text} data: {status_text(states, role_nodes)}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -1204,7 +1272,7 @@ def run_loop(args: argparse.Namespace, sock: socket.socket) -> int:
 
             if output_count == 0 and args.startup_timeout > 0.0 and now - start_wait >= args.startup_timeout:
                 raise RuntimeError(
-                    "timed out waiting for left/right MI1 acceleration, gyroscope and quaternion frames. "
+                    f"timed out waiting for left/right MI1 {required_signal_text} frames. "
                     f"Decoded state: {status_text(states, role_nodes)}. "
                     "Check CAN_H/CAN_L, termination, slcand can0, 1 Mbit/s baud, protocol, and node IDs 0x01/0x02."
                 )
