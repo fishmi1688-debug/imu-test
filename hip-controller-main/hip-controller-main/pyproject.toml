@@ -1,0 +1,102 @@
+[project]
+name = "hip_controller"
+version = "0.2.0"
+description = "Lower limb exosuit hip controller."
+readme = "README.md"
+authors = [
+    { name = "Tsmorz", email = "tony.smoragiewicz@tum.de" },
+    { name = "Zhongge Lin", email = "zg.lin@outlook.com" },
+]
+requires-python = ">=3.10,<3.14"
+
+# --- Core dependencies: NO hardware here ---
+dependencies = [
+  "numpy>=2.2.3",
+  "loguru>=0.7.3",
+  "scipy>=1.14.0",
+  "pandas>=2.3.3",
+  "pyqtgraph>=0.13.7",
+  "pyside6==6.7.3",
+  "pyqt6==6.7.1",
+  "matplotlib>=3.10.8",
+  "tomli>=2.0.0; python_version < '3.11'",
+]
+
+# --- Optional dependency groups (PEP 621 standard) ---
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6.9",
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "pre-commit>=4.1.0",
+    "coveralls>=4.0.1",
+    "pyright>=1.1.408",
+    "openpyxl==3.1.5",
+    "darglint>=1.8.1",
+]
+hw = [
+]
+no_hw = [
+]
+
+[project.urls]
+homepage = "https://github.com/TUM-Aries-Lab/hip-controller"
+
+# -------------------------------------------------------------------
+# RUFF configuration
+# -------------------------------------------------------------------
+[tool.ruff]
+line-length = 88
+fix = true
+
+lint.select = [
+  "E",        # Pycodestyle errors (indentation, whitespace, formatting)
+  "W",        # Pycodestyle warnings (trailing spaces, stylistic issues)
+  "F",        # Pyflakes correctness (undefined names, unused imports, etc.)
+  "C90",      # McCabe complexity (flags overly complex functions)
+  "I",        # Import sorting and grouping (isort rules)
+  "N",        # Naming conventions (PEP 8: snake_case, PascalCase, constants)
+  "D",        # Docstring style and presence (pydocstyle)
+  "UP",       # Modern Python syntax upgrades (pyupgrade)
+  "B",        # Bugbear: common bugs, logic issues, unsafe patterns
+  "S",        # Bandit security checks (eval, insecure hashes, etc.)
+  "YTT",      # Python version–specific traps (flake8-2020)
+  "Q",        # Quote consistency (flake8-quotes)
+  "PL",       # Pylint rules (readability, unused vars, unnecessary else, etc.)
+  "RUF",      # Ruff-specific rules (formatter compatibility, extra checks)
+  "T20",      # Disallow print() / pprint() (prefer proper logging)
+  "F841",     # Unused local variables (Pyflakes-specific)
+  "ERA001",   # Commented-out code detection (eradicate)
+  "PLR0913",  #
+]
+
+lint.ignore = [
+  "D203","D213","E501","N803","N806","D415","S101","E203","E731",
+  "D107","PLR2004","S607","S605","S603", "S311", "PLC0415"
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["hip_controller"]
+combine-as-imports = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+# BUILD SYSTEM (Hatchling via uv)
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Tell hatchling where the package lives (src layout)
+[tool.hatch.build.targets.wheel]
+packages = ["src/hip_controller"]
+
+# Include files in source distributions
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/hip_controller",
+  "README.md",
+  "LICENSE",
+]

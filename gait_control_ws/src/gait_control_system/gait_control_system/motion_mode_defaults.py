@@ -60,7 +60,7 @@ _BASE_MOTION_MODES: Dict[str, Dict[str, Any]] = {
         "flex_tf": 0.9,
         "flex_p": 0.2,
         "flex_Tmax": 5.0,
-        "phase_bias": 0.0,
+        "phase_bias": -0.5,
         "phase_bias_at_0p6": 0.0,
         "phase_bias_slope": 0.0,
         "event_prob_threshold": 0.8,  # stairs_down复用cycling启停模型阈值（0~1）
@@ -131,7 +131,7 @@ _BASE_MOTION_MODES: Dict[str, Dict[str, Any]] = {
         "flex_tf": 0.90,
         "flex_p": 0.20,
         "flex_Tmax": 5.0,
-        "phase_bias": 0.06,  # 骑行时可能需要正的相位偏置以适应不同的动力学特性
+        "phase_bias": -0.5,
         "phase_bias_at_0p6": CYCLING_LINEAR_BIAS_AT_0P6,
         "phase_bias_slope": CYCLING_LINEAR_SLOPE,
         "event_prob_threshold": 0.8,  # cycling启停事件概率阈值（0~1）
@@ -148,7 +148,7 @@ _BASE_MOTION_MODES: Dict[str, Dict[str, Any]] = {
         "flex_tf": 0.9,
         "flex_p": 0.2,
         "flex_Tmax": 5.0,
-        "phase_bias": 0.0,
+        "phase_bias": -0.5,
         "phase_bias_at_0p6": 0.0,
         "phase_bias_slope": 0.0,
         "event_prob_threshold": 0.8,  # uphill复用cycling启停模型阈值（0~1）
@@ -165,7 +165,7 @@ _BASE_MOTION_MODES: Dict[str, Dict[str, Any]] = {
         "flex_tf": 0.80,
         "flex_p": 0.80,
         "flex_Tmax": 5.0,
-        "phase_bias": -0.20, 
+        "phase_bias": -0.5,
         "phase_bias_at_0p6": 0.0,
         "phase_bias_slope": 0.0,
         "description": "适用于下坡行走",
@@ -201,7 +201,7 @@ _BASE_MOTION_MODES: Dict[str, Dict[str, Any]] = {
         "flex_tf": 0.80,
         "flex_p": 0.80,
         "flex_Tmax": 5.0,
-        "phase_bias": -0.5,
+        "phase_bias": 0.0,
         "phase_bias_at_0p6": 0.0,
         "phase_bias_slope": 0.0,
         "event_prob_threshold": 0.8,

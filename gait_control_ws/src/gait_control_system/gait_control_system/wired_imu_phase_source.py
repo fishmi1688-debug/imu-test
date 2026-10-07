@@ -174,7 +174,7 @@ class WiredCanImuPhaseSource:
             1.0,
         )
         self.require_quaternion = (
-            _env_enabled("GAIT_IMU_PHASE_CAN_REQUIRE_QUATERNION", True)
+            _env_enabled("GAIT_IMU_PHASE_CAN_REQUIRE_QUATERNION", False)
             if require_quaternion is None
             else bool(require_quaternion)
         )

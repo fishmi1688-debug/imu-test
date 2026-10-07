@@ -93,6 +93,41 @@ def quaternion_rotate_vector(
     )
 
 
+def _basis_axis(index: int) -> tuple[float, float, float]:
+    return tuple(1.0 if component_index == int(index) else 0.0 for component_index in range(3))
+
+
+def _dot3(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _cross3(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _sub3(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _scale3(a: tuple[float, float, float], scale: float) -> tuple[float, float, float]:
+    return (a[0] * scale, a[1] * scale, a[2] * scale)
+
+
+def _norm3(a: tuple[float, float, float]) -> float:
+    return math.sqrt(_dot3(a, a))
+
+
+def _normalize3(a: tuple[float, float, float]) -> Optional[tuple[float, float, float]]:
+    norm = _norm3(a)
+    if norm <= EPSILON:
+        return None
+    return _scale3(a, 1.0 / norm)
+
+
 def _axis_index(axis: str | int, *, name: str) -> int:
     if isinstance(axis, int):
         value = int(axis)
@@ -101,10 +136,42 @@ def _axis_index(axis: str | int, *, name: str) -> int:
         raise ValueError(f"{name} must be 0, 1, 2 or x, y, z")
 
     cleaned = str(axis or "").strip().lower()
+    if cleaned.startswith(("-", "+")):
+        cleaned = cleaned[1:]
     axis_map = {"x": 0, "0": 0, "y": 1, "1": 1, "z": 2, "2": 2}
     if cleaned not in axis_map:
         raise ValueError(f"{name} must be x, y, z, 0, 1, or 2")
     return axis_map[cleaned]
+
+
+def _axis_vector(axis: str | int | tuple[float, float, float] | list[float]) -> tuple[float, float, float]:
+    """Return a normalized xyz axis vector for a named axis or explicit vector."""
+    if isinstance(axis, (tuple, list)):
+        components = tuple(float(component) for component in axis)
+        if len(components) != 3:
+            raise ValueError("axis vector must contain three components")
+    else:
+        cleaned = str(axis or "").strip().lower()
+        sign = -1.0 if cleaned.startswith("-") else 1.0
+        index = _axis_index(cleaned, name="axis")
+        components = tuple(sign if component_index == index else 0.0 for component_index in range(3))
+
+    norm = math.sqrt(sum(component * component for component in components))
+    if norm <= EPSILON:
+        raise ValueError("axis vector norm must be positive")
+    return tuple(component / norm for component in components)
+
+
+def project_gyro_to_axis(
+    gyro_xyz: tuple[float, float, float] | list[float],
+    sagittal_axis: str | int | tuple[float, float, float] | list[float] = "y",
+) -> float:
+    """Project the three-axis gyro rate onto the thigh sagittal rotation axis."""
+    gyro = tuple(float(component) for component in gyro_xyz)
+    if len(gyro) != 3:
+        raise ValueError("gyro_xyz must contain three components")
+    axis = _axis_vector(sagittal_axis)
+    return sum(rate * axis_component for rate, axis_component in zip(gyro, axis))
 
 
 @dataclass
@@ -116,8 +183,11 @@ class ImuPhaseConfig:
     gyro_source: str = "axis"
     acc_angle_numerator_axis: str | int = "z"
     acc_angle_denominator_axis: str | int = "x"
+    acc_angle_numerator_sign: float = 1.0
+    acc_angle_denominator_sign: float = 1.0
     gyro_axis: str | int = "y"
-    quaternion_thigh_axis: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    gyro_sagittal_axis: tuple[float, float, float] | None = None
+    quaternion_thigh_axis: str | int | tuple[float, float, float] = "x"
     quaternion_sagittal_forward_axis: str | int = "x"
     quaternion_sagittal_vertical_axis: str | int = "z"
     quaternion_gyro_sagittal_axis: str | int = "y"
@@ -130,6 +200,7 @@ class ImuPhaseConfig:
     complementary_acc_weight: float = 0.02
     phase_peak_ratio: float = 0.60
     phase_offset: float = 0.0
+    startup_warmup_strides: int = 0
     clamp_phase: bool = True
     motion_timeout_sec: float = 0.45
     motion_window_sec: float = 0.5
@@ -141,6 +212,20 @@ class ImuPhaseConfig:
     max_angle_jump_deg: float = 65.0
     max_gyro_jump_deg_s: float = 1000.0
     max_phase_rate_hz: float = 0.0
+    startup_seed_enabled: bool = True
+    startup_seed_min_window_sec: float = 0.10
+    startup_seed_max_window_sec: float = 0.20
+    startup_seed_gyro_threshold_deg_s: float = 15.0
+    startup_seed_angle_threshold_deg: float = 3.0
+    startup_seed_positive_gyro_phase_rad: float = 0.0
+    startup_seed_negative_gyro_phase_rad: float = -math.pi
+    startup_seed_ramp_sec: float = 0.30
+    stop_detection_window_sec: float = 0.30
+    stop_detection_hold_sec: float = 0.12
+    stop_gyro_rms_threshold_deg_s: float = 8.0
+    stop_angle_range_threshold_deg: float = 3.0
+    stop_phase_rate_limit_hz: float = 4.0
+    stop_phase_unstable_hold_sec: float = 0.25
 
 
 @dataclass
@@ -164,6 +249,12 @@ class ImuPhaseOutput:
     sample_rejected: bool = False
     reject_reason: str = ""
     phase_limited: bool = False
+    angle_drift_removed_deg: float = 0.0
+    temporary_phase_active: bool = False
+    startup_ramp_scale: float = 1.0
+    startup_seed_phase_rad: Optional[float] = None
+    stopped_event: bool = False
+    walking_mode: bool = True
 
 
 class FirstOrderLowpass:
@@ -193,17 +284,57 @@ class FirstOrderLowpass:
         return self.value
 
 
+class WrappedAngleLowpass:
+    """First-order lowpass for wrapped angles using the shortest angular delta."""
+
+    def __init__(self, cutoff_hz: float):
+        self.cutoff_hz = float(cutoff_hz)
+        self.value_rad: Optional[float] = None
+        self.time_sec: Optional[float] = None
+
+    def reset(self) -> None:
+        self.value_rad = None
+        self.time_sec = None
+
+    def update(self, angle_deg: float, time_sec: float) -> float:
+        current_rad = math.radians(float(angle_deg))
+        if self.value_rad is None or self.time_sec is None or self.cutoff_hz <= 0.0:
+            self.value_rad = math.atan2(math.sin(current_rad), math.cos(current_rad))
+            self.time_sec = float(time_sec)
+            return math.degrees(self.value_rad)
+
+        dt = max(0.0, float(time_sec) - self.time_sec)
+        if dt <= EPSILON:
+            return math.degrees(self.value_rad)
+
+        tau = 1.0 / (2.0 * math.pi * self.cutoff_hz)
+        alpha = dt / (tau + dt)
+        delta_rad = math.atan2(
+            math.sin(current_rad - self.value_rad),
+            math.cos(current_rad - self.value_rad),
+        )
+        self.value_rad = math.atan2(
+            math.sin(self.value_rad + alpha * delta_rad),
+            math.cos(self.value_rad + alpha * delta_rad),
+        )
+        self.time_sec = float(time_sec)
+        return math.degrees(self.value_rad)
+
+
 class ThighImuPhaseEstimator:
     """Estimate 0-1 gait phase from thigh sagittal angle and angular velocity.
 
     By default the event detector follows the earlier thigh IMU convention:
     angle = atan2(Acc_Z, Acc_X), angular velocity = Gyr_Y, phase zero is the
     positive-to-negative Gyr_Y zero crossing after sufficient swing amplitude.
-    Quaternion angle sources use the original quaternion-to-Euler conversion
-    for the thigh sagittal angle. Angular velocity always comes from the IMU
-    gyroscope axis; it is never computed by differencing the angle. The
-    accelerometer is used as a low-weight gravity reference when a quaternion
-    angle is available.
+    Quaternion Euler angle sources expose the original quaternion-to-Euler
+    conversion for comparison. ``quat_sagittal`` rotates the configured thigh
+    axis by the quaternion, removes heading by deriving the current forward
+    direction from the rotated sagittal/lateral axis, then projects the thigh
+    axis onto that dynamic forward/vertical plane. Angular velocity always
+    comes from the IMU gyroscope axis; it is never computed by differencing the
+    angle. The accelerometer is used as a low-weight gravity reference when a
+    quaternion angle is available.
     During a cycle, phase advances using the previous observed cycle period.
     Axis fields in ImuPhaseConfig let mounted sensors remap this without
     changing the detector logic. Samples may be 6D [acc, gyro] or 10D
@@ -221,7 +352,18 @@ class ThighImuPhaseEstimator:
             self.config.acc_angle_denominator_axis,
             name="acc_angle_denominator_axis",
         )
+        self.acc_angle_numerator_sign = float(
+            getattr(self.config, "acc_angle_numerator_sign", 1.0)
+        )
+        self.acc_angle_denominator_sign = float(
+            getattr(self.config, "acc_angle_denominator_sign", 1.0)
+        )
         self.gyro_index = 3 + _axis_index(self.config.gyro_axis, name="gyro_axis")
+        self.gyro_sagittal_axis = _axis_vector(
+            self.config.gyro_axis
+            if self.config.gyro_sagittal_axis is None
+            else self.config.gyro_sagittal_axis
+        )
         self.quaternion_sagittal_forward_index = _axis_index(
             self.config.quaternion_sagittal_forward_axis,
             name="quaternion_sagittal_forward_axis",
@@ -234,16 +376,11 @@ class ThighImuPhaseEstimator:
             self.config.quaternion_gyro_sagittal_axis,
             name="quaternion_gyro_sagittal_axis",
         )
-        thigh_axis = tuple(float(component) for component in self.config.quaternion_thigh_axis)
-        if len(thigh_axis) != 3:
-            raise ValueError("quaternion_thigh_axis must contain three components")
-        thigh_axis_norm = math.sqrt(sum(component * component for component in thigh_axis))
-        if thigh_axis_norm <= EPSILON:
-            raise ValueError("quaternion_thigh_axis norm must be positive")
-        self.quaternion_thigh_axis = tuple(
-            component / thigh_axis_norm for component in thigh_axis
+        self.quaternion_thigh_axis = _axis_vector(self.config.quaternion_thigh_axis)
+        self.quaternion_sagittal_lateral_axis = _axis_vector(
+            self.config.quaternion_gyro_sagittal_axis
         )
-        self.angle_filter = FirstOrderLowpass(self.config.lowpass_cutoff_hz)
+        self.angle_filter = WrappedAngleLowpass(self.config.lowpass_cutoff_hz)
         self.gyro_filter = FirstOrderLowpass(self.config.lowpass_cutoff_hz)
         self.reset()
 
@@ -276,11 +413,24 @@ class ThighImuPhaseEstimator:
     def update_swing_threshold(self, threshold_deg: float) -> None:
         self.config.min_swing_range_deg = max(0.0, float(threshold_deg))
 
-    def process_6d(self, sample_6d, sample_time: float) -> ImuPhaseOutput:
+    def process_6d(
+        self,
+        sample_6d,
+        sample_time: float,
+        *,
+        angle_source_override: Optional[str] = None,
+    ) -> ImuPhaseOutput:
         """Process [acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z, ...]."""
-        angle_raw, gyro_raw = self.extract_raw_signal(sample_6d)
+        angle_raw, gyro_raw = self.extract_raw_signal(
+            sample_6d,
+            angle_source_override=angle_source_override,
+        )
         angle_reference = angle_raw
-        angle_source = str(getattr(self.config, "angle_source", "acc")).strip().lower()
+        angle_source = str(
+            angle_source_override
+            if angle_source_override is not None
+            else getattr(self.config, "angle_source", "acc")
+        ).strip().lower()
         if angle_source.startswith("quat"):
             acc_angle = self._extract_accelerometer_angle(sample_6d)
             if math.isfinite(acc_angle) and math.isfinite(angle_raw):
@@ -296,18 +446,27 @@ class ThighImuPhaseEstimator:
             gyro_raw,
             sample_time,
             reference_angle_deg=angle_reference,
+            angle_source_override=angle_source,
         )
 
-    def extract_raw_signal(self, sample_6d) -> tuple[float, float]:
+    def extract_raw_signal(
+        self,
+        sample_6d,
+        *,
+        angle_source_override: Optional[str] = None,
+    ) -> tuple[float, float]:
         """Return configured raw sagittal angle and angular velocity in deg/deg-s."""
         values = [float(value) for value in sample_6d]
         if len(values) < 6:
             raise ValueError(f"IMU phase sample needs at least 6 values, got {len(values)}")
-        acc_numerator = values[self.acc_angle_numerator_index]
-        acc_denominator = values[self.acc_angle_denominator_index]
-        gyro_axis_value = values[self.gyro_index]
+        acc_numerator = self.acc_angle_numerator_sign * values[self.acc_angle_numerator_index]
+        acc_denominator = self.acc_angle_denominator_sign * values[self.acc_angle_denominator_index]
         angle_acc_deg = math.degrees(math.atan2(acc_numerator, acc_denominator))
-        angle_source = str(getattr(self.config, "angle_source", "acc")).strip().lower()
+        angle_source = str(
+            angle_source_override
+            if angle_source_override is not None
+            else getattr(self.config, "angle_source", "acc")
+        ).strip().lower()
         angle_selected_deg = angle_acc_deg
         if angle_source.startswith("quat") and len(values) >= 10:
             euler_x_deg, euler_y_deg, euler_z_deg = quaternion_to_euler_xyz_degrees(
@@ -316,26 +475,71 @@ class ThighImuPhaseEstimator:
                 values[8],
                 values[9],
             )
-            if angle_source == "quat_x":
+            if angle_source == "quat_sagittal":
+                try:
+                    angle_selected_deg = self._extract_heading_free_sagittal_angle(values)
+                except Exception:
+                    angle_selected_deg = euler_y_deg
+            elif angle_source == "quat_x":
                 angle_selected_deg = euler_x_deg
-            elif angle_source in ("quat_y", "quat_sagittal"):
-                # quat_sagittal is kept as a compatibility name, but uses
-                # the original Euler-Y sagittal angle calculation.
+            elif angle_source == "quat_y":
                 angle_selected_deg = euler_y_deg
             elif angle_source == "quat_z":
                 angle_selected_deg = euler_z_deg
         angle_raw = self.config.angle_sign * angle_selected_deg
-        gyro_raw = self.config.gyro_sign * gyro_axis_value
+        gyro_raw = self.config.gyro_sign * project_gyro_to_axis(
+            values[3:6],
+            self.gyro_sagittal_axis,
+        )
         if str(self.config.gyro_unit).strip().lower().startswith("rad"):
             gyro_raw = math.degrees(gyro_raw)
         return float(angle_raw), float(gyro_raw)
+
+    def _extract_heading_free_sagittal_angle(self, values: list[float]) -> float:
+        """Return thigh sagittal angle with the horizontal heading removed."""
+        rotated_thigh_axis = quaternion_rotate_vector(
+            values[6],
+            values[7],
+            values[8],
+            values[9],
+            self.quaternion_thigh_axis,
+        )
+        rotated_lateral_axis = quaternion_rotate_vector(
+            values[6],
+            values[7],
+            values[8],
+            values[9],
+            self.quaternion_sagittal_lateral_axis,
+        )
+        vertical_axis = _basis_axis(self.quaternion_sagittal_vertical_index)
+        fallback_forward_axis = _basis_axis(self.quaternion_sagittal_forward_index)
+
+        lateral_vertical = _scale3(
+            vertical_axis,
+            _dot3(rotated_lateral_axis, vertical_axis),
+        )
+        lateral_horizontal = _sub3(rotated_lateral_axis, lateral_vertical)
+        lateral_horizontal_unit = _normalize3(lateral_horizontal)
+        if lateral_horizontal_unit is None:
+            forward_axis = fallback_forward_axis
+        else:
+            # Body Y is mounted left on MI1. The left-axis crossed with the
+            # vertical axis gives the user's instantaneous heading, so a
+            # 180-degree turn no longer flips the sagittal angle sign.
+            forward_axis = _normalize3(_cross3(lateral_horizontal_unit, vertical_axis))
+            if forward_axis is None:
+                forward_axis = fallback_forward_axis
+
+        forward_component = _dot3(rotated_thigh_axis, forward_axis)
+        vertical_component = _dot3(rotated_thigh_axis, vertical_axis)
+        return math.degrees(math.atan2(forward_component, vertical_component))
 
     def _extract_accelerometer_angle(self, sample_6d) -> float:
         values = [float(value) for value in sample_6d]
         if len(values) < 6:
             return float("nan")
-        numerator = values[self.acc_angle_numerator_index]
-        denominator = values[self.acc_angle_denominator_index]
+        numerator = self.acc_angle_numerator_sign * values[self.acc_angle_numerator_index]
+        denominator = self.acc_angle_denominator_sign * values[self.acc_angle_denominator_index]
         if not math.isfinite(numerator) or not math.isfinite(denominator):
             return float("nan")
         return self.config.angle_sign * math.degrees(math.atan2(numerator, denominator))
@@ -347,6 +551,7 @@ class ThighImuPhaseEstimator:
         sample_time: float,
         *,
         reference_angle_deg: Optional[float] = None,
+        angle_source_override: Optional[str] = None,
     ) -> ImuPhaseOutput:
         """Process an already-computed sagittal angle signal."""
         angle_raw = float(angle_raw_deg)
@@ -365,7 +570,16 @@ class ThighImuPhaseEstimator:
         )
         angle_acc = self.angle_filter.update(angle_reference, sample_time)
         gyro = self.gyro_filter.update(gyro_raw, sample_time)
-        angle = self._update_complementary_angle(angle_acc, gyro, sample_time)
+        angle_source = str(
+            angle_source_override
+            if angle_source_override is not None
+            else getattr(self.config, "angle_source", "acc")
+        ).strip().lower()
+        angle = (
+            self._update_complementary_angle(angle_acc, gyro, sample_time)
+            if angle_source.startswith("quat")
+            else angle_acc
+        )
         recent_swing_range = self._update_recent_swing_window(sample_time, angle)
         self._update_cycle_extrema(angle)
         zero_event = self._detect_gyro_zero_crossing(sample_time, angle, gyro)

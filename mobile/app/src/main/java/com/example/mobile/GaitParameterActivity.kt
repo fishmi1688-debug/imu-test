@@ -981,6 +981,7 @@ class GaitParameterActivity : AppCompatActivity() {
             return
         }
         val params = currentAssistPreviewParams() ?: return
+        assistCurveEditorView.setLeftWiredImuPhaseBiasStyle(currentModeKey == "imu_left_phase")
         assistCurveEditorView.setParams(params)
         val summary = AssistCurveMath.sample(params)
 

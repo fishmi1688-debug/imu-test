@@ -1,0 +1,176 @@
+"""Code to help initialize pytest."""
+
+import math
+import os
+import sys
+from pathlib import Path
+
+from hip_controller.definitions import TESTING_DIR, SensorSignal, StrEnum
+
+# Add the src directory to the path so that the quaternion_ekf package can be imported
+my_path = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(my_path, "../src"))
+
+
+REL_TOL = 1e-9
+
+
+# File folder path for testing
+TESTING_CONTROLLER_DIR = TESTING_DIR / "controller_test" / "testing_data"
+
+
+# General testing files
+DATA_REFERENCE_MOTION_RIGHT: Path = (
+    TESTING_CONTROLLER_DIR / "reference_motion_2026_03_06.csv"
+)
+# Preprocessing testing files
+DATA_PRE_PROCESSING: Path = TESTING_CONTROLLER_DIR / "filtering_2026_03_19.csv"
+# High level controller testing files
+DATA_ZERO_CROSSING: Path = TESTING_CONTROLLER_DIR / "zero_crossing_left_2026_01_09.csv"
+
+DATA_VALID_TRIGGER: Path = TESTING_CONTROLLER_DIR / "valid_trigger_left_2026_01_15.csv"
+
+DATA_EXTREMA_VALUES: Path = TESTING_CONTROLLER_DIR / "extrema_2026_01_26.csv"
+
+DATA_STRIDE_EVENT_DETECTOR: Path = (
+    TESTING_CONTROLLER_DIR / "stride_event_detector_2026_02_26.csv"
+)
+DATA_HIGH_LEVEL: Path = TESTING_CONTROLLER_DIR / "gait_phase_left_2026_03_03.csv"
+
+# Mid level controller testing files
+DATA_MOTION_MAPPING: Path = TESTING_CONTROLLER_DIR / "look_up_table_2026_02_25.csv"
+
+DATA_AMPLITUDE_MODULATION: Path = (
+    TESTING_CONTROLLER_DIR / "amplitude_modulation_2026_03_03.csv"
+)
+
+DATA_REFERENCE_MOTION_LEFT: Path = (
+    TESTING_CONTROLLER_DIR / "reference_motion_2026_03_05.csv"
+)
+
+# Low level controller testing files
+DATA_SECOND_ORDER_LOW_PASS_FILTER: Path = (
+    TESTING_CONTROLLER_DIR / "second_order_lpf_2026_03_06.csv"
+)
+
+
+class KinematicsDataColumnName(StrEnum):
+    """Names of columns for csv files for high-level controller testing."""
+
+    TIMESTAMP = "time (s)"
+    ANGLE_LEFT = "angle_left (rad)"
+    VELOCITY_LEFT = "vel_left (rad/s)"
+
+    TRIGG_VEL_MAX = "vel_max_trigg_left"
+    TRIGG_ANG_MAX = "ang_max_trigg_left"
+    TRIGG_VEL_MIN = "vel_min_trigg_left"
+    TRIGG_ANG_MIN = "ang_min_trigg_left"
+
+    VALID_TRIGG_VEL_MAX = "valid_vel_max_left"
+    VALID_TRIGG_ANG_MAX = "valid_ang_max_left"
+    VALID_TRIGG_VEL_MIN = "valid_vel_min_left"
+    VALID_TRIGG_ANG_MIN = "valid_ang_min_left"
+
+    VALUE_VEL_MAX = "vel_max_left (rad/s)"
+    VALUE_VEL_MIN = "vel_min_left (rad/s)"
+    VALUE_ANG_MAX = "ang_max_left (rad)"
+    VALUE_ANG_MIN = "ang_min_left (rad)"
+
+    CENTER_ANG = "center_ang"
+    CENTER_VEL = "center_vel"
+
+    VEL_STEADY_STATE = "normalized_centered_velocity"
+    ANG_STEADY_STATE = "normalized_centered_angle"
+    RESCALE_FACTOR = "gamma"
+
+    # Stride event detector
+    NOT_INITIALIZED = "before_initialization"
+    ENABLE_TRIGGER = "enable_trigger"
+    ENABLE_DETECTOR = "enable_detector"
+    VALID_STRIDE = "valid_stride"
+    STRIDE_EVENT = "stride_event"
+
+    # Amplitude Modulation
+    RADIUS = "portrait_radius"
+    SCALED_RADIUS = "scaled_portrait_radius"
+    SIGMOID_RADIUS = "after_sigmoid"
+    AMPLITUDE_LEFT = "amplitude"
+
+    # Reference Motion
+    GAIT_PHASE_LEFT = "gait_phase_left"
+    SIN_WAVE_LEFT = "sinusoidal_behavior"
+    REF_MOT_LEFT = "reference_motion"
+
+    # Cubic Spline Interpolation
+    MAPPING_KEY = "motion_mapping_key"
+    MAPPING_VALUE = "motion_mapping_value"
+
+    # Right lower limb tests
+    ANG_RIGHT = "angle_right (rad)"
+    VEL_RIGHT = "velocity_right (rad/s)"
+
+    GAIT_PHASE_RIGHT = "gait_phase_right"
+    SIN_WAVE_RIGHT = "sinusoidal_behavior_right"
+    AMPLITUDE_RIGHT = "amplitude_right"
+
+    REF_MOT_RIGHT = "motor_reference_right (rad)"
+
+    # Signal pre-processing with raw left angle
+    RAW_ANG_LEFT = "angle_left_raw (rad)"
+
+    NO_DRIFT_ANG_LPF = "angle_no_drift_lpf"
+    NO_DRIFT_ANG_NOTCH = "angle_no_drift_notch"
+
+    FILTERED_ANG_SOGIFLL = "angle_surrogate_sogifll"
+    FILTERED_VEL_SOGIFLL = "vel_quadrature_sogifll"
+
+    FILTERED_VEL_DISCRETE = "vel_discrete_derivative"
+
+    FILTERED_ANG_LPF = "angle_filtered_lpf"
+    FILTERED_VEL_LPF = "vel_derivative_lpf"
+
+
+# ---------------------------------------------------------------------------
+# Synthetic-signal helpers for property-based tests.
+#
+# Property tests assert invariants that survive retuning, so they drive the
+# controller with generated signals rather than recorded traces. Recorded
+# traces stay in use only where the expected value follows from a mathematical
+# specification rather than from a tuning constant.
+# ---------------------------------------------------------------------------
+
+SAMPLE_RATE_HZ: int = 100
+
+
+def synthetic_gait(
+    frequency_hz: float = 0.9,
+    amplitude_rad: float = 0.4,
+    duration_s: float = 6.0,
+    sample_rate_hz: int = SAMPLE_RATE_HZ,
+    phase_offset_rad: float = 0.0,
+) -> list[SensorSignal]:
+    """Build a clean sinusoidal hip trace standing in for steady walking.
+
+    Velocity is the analytic derivative of the angle, so angle and velocity are
+    mutually consistent the way a real (well-filtered) sensor pair would be.
+
+    :param float frequency_hz: Stride frequency [Hz].
+    :param float amplitude_rad: Peak hip angle [rad].
+    :param float duration_s: Length of the generated trace [s].
+    :param int sample_rate_hz: Sampling rate [Hz].
+    :param float phase_offset_rad: Constant phase added to the sine [rad].
+    :return: Consecutive samples spanning ``duration_s``.
+    :rtype: list[SensorSignal]
+    """
+    omega = 2.0 * math.pi * frequency_hz
+    return [
+        SensorSignal(
+            timestamp=i / sample_rate_hz,
+            angle_rad=amplitude_rad
+            * math.sin(omega * i / sample_rate_hz + phase_offset_rad),
+            velocity_rad_per_sec=amplitude_rad
+            * omega
+            * math.cos(omega * i / sample_rate_hz + phase_offset_rad),
+        )
+        for i in range(int(duration_s * sample_rate_hz))
+    ]

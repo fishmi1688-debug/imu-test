@@ -37,6 +37,8 @@ class AssistCurveEditorView @JvmOverloads constructor(
         private const val minPhaseGap = 0.02
         private const val phaseComfortLower = -0.35
         private const val phaseComfortUpper = 0.35
+        private const val leftWiredImuPhaseComfortLower = -0.15
+        private const val leftWiredImuPhaseComfortUpper = 0.15
         private const val fullCircleRadians = 6.283185307179586
         private const val phaseOvalStartAngle = -1.5707963267948966
     }
@@ -84,6 +86,7 @@ class AssistCurveEditorView @JvmOverloads constructor(
     )
 
     private var activeTarget = DragTarget.NONE
+    private var leftWiredImuPhaseBiasStyle = false
     private val gridPathEffect = DashPathEffect(floatArrayOf(dp(4f), dp(4f)), 0f)
     private val helperPath = Path()
 
@@ -213,6 +216,14 @@ class AssistCurveEditorView @JvmOverloads constructor(
     }
 
     fun getParams(): AssistCurveParams = params
+
+    fun setLeftWiredImuPhaseBiasStyle(enabled: Boolean) {
+        if (leftWiredImuPhaseBiasStyle == enabled) {
+            return
+        }
+        leftWiredImuPhaseBiasStyle = enabled
+        invalidate()
+    }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val desiredHeight = dp(400f).roundToInt() + paddingTop + paddingBottom
@@ -493,6 +504,16 @@ class AssistCurveEditorView @JvmOverloads constructor(
 
     private fun drawPhaseBiasZones(canvas: Canvas, oval: RectF) {
         canvas.drawOval(oval, phaseSpecialPaint)
+        if (leftWiredImuPhaseBiasStyle) {
+            canvas.drawArc(
+                oval,
+                phaseBiasAngleDegrees(leftWiredImuPhaseComfortLower),
+                phaseBiasSweepDegrees(leftWiredImuPhaseComfortLower, leftWiredImuPhaseComfortUpper),
+                false,
+                phaseComfortPaint
+            )
+            return
+        }
         canvas.drawArc(
             oval,
             phaseBiasAngleDegrees(phaseMin),

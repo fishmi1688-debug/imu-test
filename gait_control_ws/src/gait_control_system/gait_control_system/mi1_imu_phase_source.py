@@ -109,13 +109,25 @@ class ImuState:
             self.frame_counts.get(decoded.signal_name, 0) + 1
         )
 
-    def is_complete(self) -> bool:
-        return self.accel_g is not None and self.gyro_dps is not None and self.quat is not None
+    @staticmethod
+    def _required_fields(require_quaternion: bool) -> tuple[str, ...]:
+        return ("accel", "gyro", "quat") if require_quaternion else ("accel", "gyro")
 
-    def is_fresh(self, now: float, max_age_sec: float, max_span_sec: float = 0.0) -> bool:
-        if not self.is_complete():
+    def is_complete(self, require_quaternion: bool = False) -> bool:
+        quat_ready = self.quat is not None or not require_quaternion
+        return self.accel_g is not None and self.gyro_dps is not None and quat_ready
+
+    def is_fresh(
+        self,
+        now: float,
+        max_age_sec: float,
+        max_span_sec: float = 0.0,
+        require_quaternion: bool = False,
+    ) -> bool:
+        if not self.is_complete(require_quaternion=require_quaternion):
             return False
-        field_times = [self.updated_at.get(name, -1e30) for name in ("accel", "gyro", "quat")]
+        field_names = self._required_fields(require_quaternion)
+        field_times = [self.updated_at.get(name, -1e30) for name in field_names]
         if max_age_sec <= 0.0:
             age_ok = True
         else:
@@ -132,28 +144,39 @@ class ImuState:
         max_age_sec: float,
         max_span_sec: float,
         last_counts: dict[str, int],
+        require_quaternion: bool = False,
     ) -> bool:
-        if not self.is_fresh(now, max_age_sec, max_span_sec):
+        if not self.is_fresh(now, max_age_sec, max_span_sec, require_quaternion=require_quaternion):
             return False
         return all(
             self.frame_counts.get(name, 0) > last_counts.get(name, 0)
-            for name in ("accel", "gyro", "quat")
+            for name in self._required_fields(require_quaternion)
         )
 
-    def mark_sample_emitted(self, last_counts: dict[str, int]) -> None:
-        for name in ("accel", "gyro", "quat"):
+    def mark_sample_emitted(
+        self,
+        last_counts: dict[str, int],
+        require_quaternion: bool = False,
+    ) -> None:
+        for name in self._required_fields(require_quaternion):
             last_counts[name] = self.frame_counts.get(name, 0)
 
-    def to_phase_sample(self) -> tuple[float, float, float, float, float, float, float, float, float, float]:
-        if self.accel_g is None or self.gyro_dps is None or self.quat is None:
-            raise ValueError("cannot build MI1 sample from incomplete state")
-        return (
+    def to_phase_sample(self, require_quaternion: bool = False) -> tuple[float, ...]:
+        if self.accel_g is None or self.gyro_dps is None:
+            raise ValueError("cannot build MI1 sample from incomplete acc/gyro state")
+        if require_quaternion and self.quat is None:
+            raise ValueError("cannot build MI1 sample from incomplete quaternion state")
+        sample = (
             float(self.accel_g.x),
             float(self.accel_g.y),
             float(self.accel_g.z),
             float(self.gyro_dps.x),
             float(self.gyro_dps.y),
             float(self.gyro_dps.z),
+        )
+        if self.quat is None:
+            return sample
+        return sample + (
             float(self.quat.w),
             float(self.quat.x),
             float(self.quat.y),
@@ -318,7 +341,7 @@ def decode_imu_frame(protocol: str, can_id: int, is_extended: bool, payload: byt
 
 
 class WiredMi1CanImuPhaseSource:
-    """Detector-compatible source exposing latest MI1 acc/gyro/quaternion samples."""
+    """Detector-compatible source exposing MI1 acc/gyro samples with optional quaternion."""
 
     def __init__(
         self,
@@ -328,6 +351,7 @@ class WiredMi1CanImuPhaseSource:
         node_id: Optional[int] = None,
         data_timeout_sec: float = DEFAULT_DATA_TIMEOUT_SEC,
         max_field_age_sec: Optional[float] = None,
+        require_quaternion: Optional[bool] = None,
     ):
         side_key = str(side or "").strip().lower()
         if side_key not in ("left", "right"):
@@ -362,6 +386,15 @@ class WiredMi1CanImuPhaseSource:
             "GAIT_MI1_MAX_FIELD_SPAN_SEC",
             DEFAULT_MAX_FIELD_SPAN_SEC,
             0.0,
+        )
+        default_require_quaternion = _env_enabled(
+            "GAIT_IMU_PHASE_MI1_REQUIRE_QUATERNION",
+            _env_enabled("GAIT_MI1_REQUIRE_QUATERNION", False),
+        )
+        self.require_quaternion = (
+            default_require_quaternion
+            if require_quaternion is None
+            else bool(require_quaternion)
         )
         self.sample_rate_hz = _read_env_float(
             "GAIT_IMU_PHASE_MI1_RATE_HZ",
@@ -402,9 +435,7 @@ class WiredMi1CanImuPhaseSource:
         self._sock: Optional[socket.socket] = None
         self._state = ImuState(self.node_id)
         self._last_emitted_counts = {"accel": 0, "gyro": 0, "quat": 0}
-        self._latest_sample: Optional[
-            tuple[tuple[float, float, float, float, float, float, float, float, float, float], float, int]
-        ] = None
+        self._latest_sample: Optional[tuple[tuple[float, ...], float, int]] = None
         self._seq = 0
         self._frame_count = 0
         self._connected = False
@@ -554,7 +585,7 @@ class WiredMi1CanImuPhaseSource:
 
     def _invalid_sample_reason(
         self,
-        sample: tuple[float, float, float, float, float, float, float, float, float, float],
+        sample: tuple[float, ...],
     ) -> str:
         if not self.reject_invalid_samples:
             return ""
@@ -571,16 +602,19 @@ class WiredMi1CanImuPhaseSource:
         if self.max_gyro_dps > 0.0 and max_abs_gyro > self.max_gyro_dps:
             return f"gyro_abs>{self.max_gyro_dps:.1f}dps"
 
-        quat_norm = math.sqrt(
-            sample[6] * sample[6]
-            + sample[7] * sample[7]
-            + sample[8] * sample[8]
-            + sample[9] * sample[9]
-        )
-        if self.min_quat_norm > 0.0 and quat_norm < self.min_quat_norm:
-            return f"quat_norm<{self.min_quat_norm:.2f}"
-        if self.max_quat_norm > 0.0 and quat_norm > self.max_quat_norm:
-            return f"quat_norm>{self.max_quat_norm:.2f}"
+        if self.require_quaternion and len(sample) < 10:
+            return "missing_quat"
+        if len(sample) >= 10:
+            quat_norm = math.sqrt(
+                sample[6] * sample[6]
+                + sample[7] * sample[7]
+                + sample[8] * sample[8]
+                + sample[9] * sample[9]
+            )
+            if self.min_quat_norm > 0.0 and quat_norm < self.min_quat_norm:
+                return f"quat_norm<{self.min_quat_norm:.2f}"
+            if self.max_quat_norm > 0.0 and quat_norm > self.max_quat_norm:
+                return f"quat_norm>{self.max_quat_norm:.2f}"
         return ""
 
     def _read_loop(self) -> None:
@@ -628,17 +662,24 @@ class WiredMi1CanImuPhaseSource:
             self.max_field_age_sec,
             self.max_field_span_sec,
             self._last_emitted_counts,
+            require_quaternion=self.require_quaternion,
         ):
             return
 
-        sample = self._state.to_phase_sample()
+        sample = self._state.to_phase_sample(require_quaternion=self.require_quaternion)
         invalid_reason = self._invalid_sample_reason(sample)
         if invalid_reason:
-            self._state.mark_sample_emitted(self._last_emitted_counts)
+            self._state.mark_sample_emitted(
+                self._last_emitted_counts,
+                require_quaternion=self.require_quaternion,
+            )
             self._last_error = f"MI1 invalid sample: {invalid_reason}"
             return
 
-        self._state.mark_sample_emitted(self._last_emitted_counts)
+        self._state.mark_sample_emitted(
+            self._last_emitted_counts,
+            require_quaternion=self.require_quaternion,
+        )
         with self._lock:
             self._seq += 1
             self._latest_sample = (sample, float(arrival_time), int(self._seq))
