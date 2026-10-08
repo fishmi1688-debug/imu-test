@@ -85,7 +85,7 @@ class AssistCurveEditorView @JvmOverloads constructor(
     )
 
     private var activeTarget = DragTarget.NONE
-    private var phaseBiasDragStarted = false
+    private var guardedDragStarted = false
     private var leftWiredImuPhaseBiasStyle = false
     private val gridPathEffect = DashPathEffect(floatArrayOf(dp(4f), dp(4f)), 0f)
     private val helperPath = Path()
@@ -277,8 +277,8 @@ class AssistCurveEditorView @JvmOverloads constructor(
                 }
                 parent?.requestDisallowInterceptTouchEvent(true)
                 activeTarget = target
-                phaseBiasDragStarted = false
-                if (target != DragTarget.PHASE_BIAS) {
+                guardedDragStarted = false
+                if (!isGuardedDragTarget(target)) {
                     updateTarget(event.x, event.y, geometry)
                 }
                 invalidate()
@@ -290,8 +290,8 @@ class AssistCurveEditorView @JvmOverloads constructor(
                     return super.onTouchEvent(event)
                 }
                 parent?.requestDisallowInterceptTouchEvent(true)
-                if (activeTarget == DragTarget.PHASE_BIAS) {
-                    phaseBiasDragStarted = true
+                if (isGuardedDragTarget(activeTarget)) {
+                    guardedDragStarted = true
                 }
                 updateTarget(event.x, event.y, geometry)
                 invalidate()
@@ -302,11 +302,11 @@ class AssistCurveEditorView @JvmOverloads constructor(
                 if (activeTarget == DragTarget.NONE) {
                     return super.onTouchEvent(event)
                 }
-                if (activeTarget != DragTarget.PHASE_BIAS || phaseBiasDragStarted) {
+                if (!isGuardedDragTarget(activeTarget) || guardedDragStarted) {
                     updateTarget(event.x, event.y, geometry)
                 }
                 activeTarget = DragTarget.NONE
-                phaseBiasDragStarted = false
+                guardedDragStarted = false
                 parent?.requestDisallowInterceptTouchEvent(false)
                 invalidate()
                 performClick()
@@ -316,7 +316,7 @@ class AssistCurveEditorView @JvmOverloads constructor(
             MotionEvent.ACTION_CANCEL -> {
                 if (activeTarget != DragTarget.NONE) {
                     activeTarget = DragTarget.NONE
-                    phaseBiasDragStarted = false
+                    guardedDragStarted = false
                     parent?.requestDisallowInterceptTouchEvent(false)
                     invalidate()
                     return true
@@ -645,14 +645,11 @@ class AssistCurveEditorView @JvmOverloads constructor(
             }
         }
 
-        val sliderHitHalfHeight = dp(22f)
-        if (x in geometry.graphRect.left - dp(12f)..geometry.graphRect.right + dp(12f)) {
-            if (abs(y - geometry.flexionSliderY) <= sliderHitHalfHeight) {
-                return DragTarget.FLEX_TMAX
-            }
-            if (abs(y - geometry.extensionSliderY) <= sliderHitHalfHeight) {
-                return DragTarget.EXT_TMAX
-            }
+        if (isNearTorqueHandle(x, y, extensionTorqueHandleX(geometry), geometry.extensionSliderY)) {
+            return DragTarget.EXT_TMAX
+        }
+        if (isNearTorqueHandle(x, y, flexionTorqueHandleX(geometry), geometry.flexionSliderY)) {
+            return DragTarget.FLEX_TMAX
         }
 
         if (isNearPhaseBiasHandle(x, y, geometry)) {
@@ -669,6 +666,12 @@ class AssistCurveEditorView @JvmOverloads constructor(
             target == DragTarget.FLEX_START ||
             target == DragTarget.FLEX_PEAK ||
             target == DragTarget.FLEX_END
+    }
+
+    private fun isGuardedDragTarget(target: DragTarget): Boolean {
+        return target == DragTarget.EXT_TMAX ||
+            target == DragTarget.FLEX_TMAX ||
+            target == DragTarget.PHASE_BIAS
     }
 
     private fun updateTarget(x: Float, y: Float, geometry: Geometry) {
@@ -890,6 +893,13 @@ class AssistCurveEditorView @JvmOverloads constructor(
             ratio -= 1.0
         }
         return ratio
+    }
+
+    private fun isNearTorqueHandle(x: Float, y: Float, handleX: Float, handleY: Float): Boolean {
+        val dx = handleX - x
+        val dy = handleY - y
+        val touchRadius = dp(18f)
+        return dx * dx + dy * dy <= touchRadius * touchRadius
     }
 
     private fun isNearPhaseBiasHandle(x: Float, y: Float, geometry: Geometry): Boolean {

@@ -55,6 +55,10 @@ class GaitParameterActivity : AppCompatActivity() {
         private val MODEL_PHASE_MODE_KEYS = emptySet<String>()
         private val WIRED_PHASE_MODE_KEYS = IMU_PHASE_MODE_KEYS + MODEL_PHASE_MODE_KEYS
         private val LEFT_STYLE_PHASE_BIAS_MODE_KEYS = IMU_PHASE_MODE_KEYS
+        private const val PHASE_BIAS_COMFORT_LOWER = -0.35
+        private const val PHASE_BIAS_COMFORT_UPPER = 0.35
+        private const val LEFT_WIRED_PHASE_BIAS_COMFORT_LOWER = -0.15
+        private const val LEFT_WIRED_PHASE_BIAS_COMFORT_UPPER = 0.15
     }
 
     private data class ParamSpec(
@@ -108,6 +112,9 @@ class GaitParameterActivity : AppCompatActivity() {
     private var detailParamsVisible = false
     private var pendingModeKey: String? = null
     private var lastStateUiSignature: String? = null
+    private var phaseBiasRedWarningShown = false
+    private var phaseBiasWarningResetInProgress = false
+    private var phaseBiasRedWarningDialog: AlertDialog? = null
     private val gaitStatusListener: (String) -> Unit = { message ->
         showStatus(message)
     }
@@ -774,6 +781,7 @@ class GaitParameterActivity : AppCompatActivity() {
         statusText: String? = null
     ) {
         val restoredScrollY = if (::paramsScrollView.isInitialized) paramsScrollView.scrollY else 0
+        resetPhaseBiasRedWarningState(dismissDialog = true)
         currentModeKey = modeKey
         if (modeDropdown.text?.toString() != modeName) {
             modeDropdown.setText(modeName, false)
@@ -921,6 +929,85 @@ class GaitParameterActivity : AppCompatActivity() {
         setParamValue("flex_Tmax", updated.flexTmax, updatePreview = false)
         setParamValue("phase_bias", updated.phaseBias, updatePreview = false)
         updateAssistCurvePreview()
+        maybeWarnForPhaseBiasRedZone(paramValues["phase_bias"] ?: updated.phaseBias)
+    }
+
+    private fun maybeWarnForPhaseBiasRedZone(phaseBias: Double) {
+        if (phaseBiasWarningResetInProgress) {
+            return
+        }
+        val inRedZone = isPhaseBiasInRedZone(phaseBias)
+        if (!inRedZone) {
+            phaseBiasRedWarningShown = false
+            return
+        }
+        if (phaseBiasRedWarningShown || phaseBiasRedWarningDialog?.isShowing == true) {
+            return
+        }
+
+        phaseBiasRedWarningShown = true
+        val modeName = GaitMotionModes.byKey[currentModeKey]?.name ?: currentModeKey
+        val defaultPhaseBias = defaultPhaseBiasForCurrentMode()
+        val candidateText = formatNumber(phaseBias, 3)
+        val defaultText = formatNumber(defaultPhaseBias, 3)
+        phaseBiasRedWarningDialog = AlertDialog.Builder(this)
+            .setTitle("相位偏置风险提示")
+            .setMessage(
+                "当前 $modeName 的相位偏置 $candidateText 已进入红色区域，可能导致助力时序过早或过晚。是否确认使用这个参数？\n\n选择“否”将恢复默认值 $defaultText。"
+            )
+            .setPositiveButton("是") { dialog, _ ->
+                showStatus("已保留红区相位偏置: $candidateText")
+                dialog.dismiss()
+            }
+            .setNegativeButton("否") { dialog, _ ->
+                resetPhaseBiasToDefaultFromWarning()
+                dialog.dismiss()
+            }
+            .setOnCancelListener {
+                resetPhaseBiasToDefaultFromWarning()
+            }
+            .create()
+            .also { dialog ->
+                dialog.setOnDismissListener {
+                    phaseBiasRedWarningDialog = null
+                }
+                dialog.show()
+            }
+    }
+
+    private fun resetPhaseBiasToDefaultFromWarning() {
+        if (phaseBiasWarningResetInProgress) {
+            return
+        }
+        phaseBiasWarningResetInProgress = true
+        val defaultPhaseBias = defaultPhaseBiasForCurrentMode()
+        setParamValue("phase_bias", defaultPhaseBias, updatePreview = false)
+        updateAssistCurvePreview()
+        phaseBiasWarningResetInProgress = false
+        phaseBiasRedWarningShown = false
+        showStatus("相位偏置已恢复默认值: ${formatNumber(defaultPhaseBias, 3)}")
+    }
+
+    private fun resetPhaseBiasRedWarningState(dismissDialog: Boolean) {
+        phaseBiasRedWarningShown = false
+        phaseBiasWarningResetInProgress = false
+        if (dismissDialog) {
+            phaseBiasRedWarningDialog?.dismiss()
+            phaseBiasRedWarningDialog = null
+        }
+    }
+
+    private fun defaultPhaseBiasForCurrentMode(): Double {
+        return GaitMotionModes.byKey[currentModeKey]?.phaseBias ?: 0.0
+    }
+
+    private fun isPhaseBiasInRedZone(value: Double): Boolean {
+        return if (currentModeKey in LEFT_STYLE_PHASE_BIAS_MODE_KEYS) {
+            value < LEFT_WIRED_PHASE_BIAS_COMFORT_LOWER ||
+                value > LEFT_WIRED_PHASE_BIAS_COMFORT_UPPER
+        } else {
+            value > PHASE_BIAS_COMFORT_LOWER && value < PHASE_BIAS_COMFORT_UPPER
+        }
     }
 
     private fun updateAssistCurvePreview() {

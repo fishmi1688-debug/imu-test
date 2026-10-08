@@ -1,3 +1,4 @@
+import math
 import os
 import struct
 import time
@@ -30,10 +31,15 @@ from .gait_constants import (
     RS01_ENABLE_FUNCTION_ID,
     RS01_EP_SCAN_TIME_INDEX,
     RS01_FEEDBACK_FUNCTION_IDS,
+    RS01_LIMIT_CUR_INDEX,
+    RS01_LIMIT_TORQUE_INDEX,
     RS01_MASTER_ID,
     RS01_MECHANICAL_ZERO_FUNCTION_ID,
     RS01_PARAM_WRITE_FUNCTION_ID,
     RS01_STOP_FUNCTION_ID,
+    RS01_STARTUP_LIMIT_CUR_A,
+    RS01_STARTUP_LIMIT_TORQUE_NM,
+    RS01_STARTUP_LIMITS_ENABLED,
     WORKSPACE_ROOT,
 )
 
@@ -132,6 +138,7 @@ class MotorController(Node):
             fd=False,
         )
         self.get_logger().info("🔗 CAN总线连接成功")
+        self.configure_all_startup_torque_limits()
         self.get_logger().info("🤖 电机控制器初始化完成")
         self.get_logger().info("📨 订阅话题: /motion_mode/set (设置运动模式)")
         self.get_logger().info("🔧 订阅话题: /mechanical_zero/command (收到后实际发送 RS01 标零命令)")
@@ -435,6 +442,63 @@ class MotorController(Node):
             )
         return self.send_frame(frame)
 
+    def write_float_parameter(self, motor_id, index, value):
+        value = float(value)
+        if not math.isfinite(value):
+            self.get_logger().warn(
+                f"❌ 参数写入失败: {self._motor_label(motor_id)} index=0x{index:04X}, value={value}"
+            )
+            return False
+        payload = self._build_param_write_payload(index, struct.pack("<f", value))
+        frame = self._make_can_frame(
+            RS01_PARAM_WRITE_FUNCTION_ID,
+            motor_id,
+            data=payload,
+            value_field=self.master_can_id,
+        )
+        if self.debug_mode:
+            self.get_logger().debug(
+                f"📝 浮点参数写入: ID=0x{frame.arbitration_id:08X}, index=0x{index:04X}, value={value:.3f}, data={payload.hex()}"
+            )
+        return self.send_frame(frame)
+
+    def configure_startup_torque_limits(self, motor_id):
+        if not RS01_STARTUP_LIMITS_ENABLED:
+            return True
+
+        limit_torque_nm = self._clamp(RS01_STARTUP_LIMIT_TORQUE_NM, 0.0, MIT_T_MAX)
+        limit_cur_a = self._clamp(RS01_STARTUP_LIMIT_CUR_A, 0.0, 23.0)
+        torque_ok = self.write_float_parameter(
+            motor_id,
+            RS01_LIMIT_TORQUE_INDEX,
+            limit_torque_nm,
+        )
+        current_ok = self.write_float_parameter(
+            motor_id,
+            RS01_LIMIT_CUR_INDEX,
+            limit_cur_a,
+        )
+        ok = bool(torque_ok and current_ok)
+        if ok:
+            self.get_logger().info(
+                f"🧰 已设置 {self._motor_label(motor_id)} RS01限扭/限流: "
+                f"limit_torque={limit_torque_nm:.1f} Nm, limit_cur={limit_cur_a:.1f} A"
+            )
+        else:
+            self.get_logger().warn(
+                f"❌ {self._motor_label(motor_id)} RS01限扭/限流设置失败: "
+                f"limit_torque_ok={torque_ok}, limit_cur_ok={current_ok}"
+            )
+        return ok
+
+    def configure_all_startup_torque_limits(self):
+        if not RS01_STARTUP_LIMITS_ENABLED:
+            self.get_logger().info("⏭️ RS01开机限扭/限流自动写入已关闭")
+            return True
+        left_ok = self.configure_startup_torque_limits(LEFT_MOTOR_ID)
+        right_ok = self.configure_startup_torque_limits(RIGHT_MOTOR_ID)
+        return bool(left_ok and right_ok)
+
     def configure_active_report_rate(self, motor_id, report_hz=None):
         if report_hz is None:
             report_hz = self.active_report_target_hz
@@ -516,6 +580,7 @@ class MotorController(Node):
         )
 
     def enable_motor(self, motor_id, active_report=True):
+        limit_ok = self.configure_startup_torque_limits(motor_id)
         report_ok = True
         if active_report:
             report_ok = self.set_active_report(
@@ -530,7 +595,7 @@ class MotorController(Node):
             value_field=self.master_can_id,
         )
         enable_ok = self.send_frame(frame)
-        ok = bool(report_ok and enable_ok)
+        ok = bool(limit_ok and report_ok and enable_ok)
         if ok:
             report_text = "并打开主动上报" if active_report else "但不打开主动上报"
             self.get_logger().info(
@@ -540,7 +605,7 @@ class MotorController(Node):
         else:
             self.get_logger().warn(
                 f"❌ 电机使能失败: {self._motor_label(motor_id)} "
-                f"(report_ok={report_ok}, enable_ok={enable_ok})"
+                f"(limit_ok={limit_ok}, report_ok={report_ok}, enable_ok={enable_ok})"
             )
         return ok
 

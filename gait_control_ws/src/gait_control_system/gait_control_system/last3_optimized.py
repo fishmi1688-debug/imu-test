@@ -245,8 +245,48 @@ def main():
         0.0,
         _read_env_float("GAIT_FAST_STATIC_STOP_ANGLE_RANGE_RAD", 0.045),
     )
+    fast_static_stop_latch_sec = max(
+        0.0,
+        _read_env_float("GAIT_FAST_STATIC_STOP_LATCH_SEC", 0.25),
+    )
+    fast_static_stop_release_velocity_rad_s = max(
+        fast_static_stop_velocity_rad_s,
+        _read_env_float("GAIT_FAST_STATIC_STOP_RELEASE_VEL_RAD_S", 0.65),
+    )
+    fast_static_stop_release_by_velocity = (
+        os.environ.get("GAIT_FAST_STATIC_STOP_RELEASE_BY_VEL", "1").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    fast_static_stop_release_min_angle_range_rad = max(
+        fast_static_stop_angle_range_rad,
+        _read_env_float(
+            "GAIT_FAST_STATIC_STOP_RELEASE_MIN_ANGLE_RANGE_RAD",
+            fast_static_stop_angle_range_rad,
+        ),
+    )
+    fast_static_stop_release_angle_range_rad = max(
+        fast_static_stop_release_min_angle_range_rad,
+        _read_env_float("GAIT_FAST_STATIC_STOP_RELEASE_ANGLE_RANGE_RAD", 0.17),
+    )
+    quiet_stop_hold_sec = max(
+        fast_static_stop_hold_sec,
+        _read_env_float("GAIT_ASSIST_QUIET_STOP_HOLD_SEC", 0.32),
+    )
+    quiet_stop_velocity_rad_s = max(
+        fast_static_stop_velocity_rad_s,
+        _read_env_float("GAIT_ASSIST_QUIET_STOP_VEL_RAD_S", 0.55),
+    )
+    quiet_stop_require_low_velocity = (
+        os.environ.get("GAIT_ASSIST_QUIET_STOP_REQUIRE_LOW_VEL", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    quiet_stop_angle_range_rad = max(
+        fast_static_stop_angle_range_rad,
+        _read_env_float("GAIT_ASSIST_QUIET_STOP_ANGLE_RANGE_RAD", 0.17),
+    )
     fast_static_stop_samples = deque()
     fast_static_stop_active = False
+    fast_static_stop_latched_until = 0.0
     last_fast_static_stop_log_time = 0.0
     last_state_signature = None
     last_state_send_time = 0.0
@@ -793,8 +833,10 @@ def main():
 
     def _reset_fast_static_stop_gate() -> None:
         nonlocal fast_static_stop_active
+        nonlocal fast_static_stop_latched_until
         fast_static_stop_samples.clear()
         fast_static_stop_active = False
+        fast_static_stop_latched_until = 0.0
 
     def _update_fast_static_stop_gate(
         now: float,
@@ -806,6 +848,7 @@ def main():
     ) -> bool:
         """连续低角速度且角度几乎不变时，快速切断助力输出。"""
         nonlocal fast_static_stop_active
+        nonlocal fast_static_stop_latched_until
         nonlocal last_fast_static_stop_log_time
 
         if not fast_static_stop_enabled:
@@ -835,38 +878,121 @@ def main():
             return False
 
         fast_static_stop_samples.append(sample)
-        cutoff_time = sample[0] - fast_static_stop_hold_sec
+        cutoff_time = sample[0] - max(fast_static_stop_hold_sec, quiet_stop_hold_sec)
         while len(fast_static_stop_samples) > 1 and fast_static_stop_samples[0][0] < cutoff_time:
             fast_static_stop_samples.popleft()
 
-        window_sec = fast_static_stop_samples[-1][0] - fast_static_stop_samples[0][0]
-        if window_sec < fast_static_stop_hold_sec:
+        active_window = [
+            item for item in fast_static_stop_samples
+            if item[0] >= sample[0] - fast_static_stop_hold_sec
+        ]
+        quiet_window = [
+            item for item in fast_static_stop_samples
+            if item[0] >= sample[0] - quiet_stop_hold_sec
+        ]
+        if len(active_window) < 2 and len(quiet_window) < 2:
             return fast_static_stop_active
 
-        left_angles = [item[1] for item in fast_static_stop_samples]
-        right_angles = [item[2] for item in fast_static_stop_samples]
-        max_abs_velocity = max(
-            max(abs(item[3]), abs(item[4])) for item in fast_static_stop_samples
+        active_window_sec = (
+            active_window[-1][0] - active_window[0][0]
+            if len(active_window) >= 2
+            else 0.0
         )
-        max_angle_range = max(
-            max(left_angles) - min(left_angles),
-            max(right_angles) - min(right_angles),
+        left_angles = [item[1] for item in active_window]
+        right_angles = [item[2] for item in active_window]
+        max_abs_velocity = (
+            max(max(abs(item[3]), abs(item[4])) for item in active_window)
+            if active_window
+            else float("inf")
         )
+        max_angle_range = (
+            max(
+                max(left_angles) - min(left_angles),
+                max(right_angles) - min(right_angles),
+            )
+            if active_window
+            else float("inf")
+        )
+        quiet_left_angles = [item[1] for item in quiet_window]
+        quiet_right_angles = [item[2] for item in quiet_window]
+        quiet_max_abs_velocity = (
+            max(max(abs(item[3]), abs(item[4])) for item in quiet_window)
+            if quiet_window
+            else float("inf")
+        )
+        quiet_max_angle_range = (
+            max(
+                max(quiet_left_angles) - min(quiet_left_angles),
+                max(quiet_right_angles) - min(quiet_right_angles),
+            )
+            if quiet_window
+            else float("inf")
+        )
+        quiet_window_sec = (
+            quiet_window[-1][0] - quiet_window[0][0]
+            if len(quiet_window) >= 2
+            else 0.0
+        )
+        try:
+            assist_left = float(
+                gait_analysis.left_hipAss[-1]
+                if getattr(gait_analysis, "left_hipAss", None)
+                else 0.0
+            )
+            assist_right = float(
+                gait_analysis.right_hipAss[-1]
+                if getattr(gait_analysis, "right_hipAss", None)
+                else 0.0
+            )
+            max_abs_assist = max(abs(assist_left), abs(assist_right))
+        except Exception:
+            max_abs_assist = 0.0
+
+        clear_motion = bool(
+            quiet_max_angle_range >= fast_static_stop_release_angle_range_rad
+            or (
+                fast_static_stop_release_by_velocity
+                and quiet_max_abs_velocity >= fast_static_stop_release_velocity_rad_s
+                and quiet_max_angle_range >= fast_static_stop_release_min_angle_range_rad
+            )
+        )
+        if fast_static_stop_active and sample[0] < fast_static_stop_latched_until:
+            return True
+        if fast_static_stop_active and not clear_motion:
+            return True
+
         static_detected = bool(
-            max_abs_velocity <= fast_static_stop_velocity_rad_s
+            active_window
+            and active_window_sec >= fast_static_stop_hold_sec
+            and max_abs_velocity <= fast_static_stop_velocity_rad_s
             and max_angle_range <= fast_static_stop_angle_range_rad
         )
+        quiet_low_velocity_ok = bool(
+            not quiet_stop_require_low_velocity
+            or quiet_max_abs_velocity <= quiet_stop_velocity_rad_s
+        )
+        quiet_stop_detected = bool(
+            quiet_window_sec >= quiet_stop_hold_sec
+            and quiet_max_angle_range <= quiet_stop_angle_range_rad
+            and quiet_low_velocity_ok
+        )
 
-        if static_detected:
+        if static_detected or quiet_stop_detected:
+            fast_static_stop_latched_until = sample[0] + fast_static_stop_latch_sec
             if (
                 not fast_static_stop_active
                 or sample[0] - last_fast_static_stop_log_time >= 1.0
             ):
+                reason = "静止" if static_detected else "停步小幅振动"
                 motor_controller.get_logger().info(
-                    "🛑 快速静止门控触发: "
-                    f"mode={mode}, window={window_sec:.3f}s, "
+                    f"🛑 快速静止门控触发({reason}): "
+                    f"mode={mode}, window={active_window_sec:.3f}s, "
                     f"max_vel={max_abs_velocity:.3f}rad/s, "
-                    f"angle_range={max_angle_range:.3f}rad"
+                    f"angle_range={max_angle_range:.3f}rad, "
+                    f"quiet_window={quiet_window_sec:.3f}s, "
+                    f"quiet_max_vel={quiet_max_abs_velocity:.3f}rad/s, "
+                    f"quiet_angle_range={quiet_max_angle_range:.3f}rad, "
+                    f"assist={max_abs_assist:.2f}Nm"
                 )
                 last_fast_static_stop_log_time = sample[0]
             fast_static_stop_active = True
@@ -876,10 +1002,13 @@ def main():
             motor_controller.get_logger().info(
                 "🚶 快速静止门控释放: "
                 f"mode={mode}, max_vel={max_abs_velocity:.3f}rad/s, "
-                f"angle_range={max_angle_range:.3f}rad"
+                f"angle_range={max_angle_range:.3f}rad, "
+                f"quiet_max_vel={quiet_max_abs_velocity:.3f}rad/s, "
+                f"quiet_angle_range={quiet_max_angle_range:.3f}rad"
             )
             last_fast_static_stop_log_time = sample[0]
         fast_static_stop_active = False
+        fast_static_stop_latched_until = 0.0
         return False
 
     def _stop_runtime_assist(reason: str, *, send_zero: bool = True) -> None:
