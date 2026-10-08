@@ -116,20 +116,13 @@ FLAG_TEST_RIGHT_ASSIST_READY = 12
 FLAG_IMU_CONNECTED = 13
 FLAG_IMU_READY = 14
 MODE_KEYS = [
-    "walking",
+    "imu_phase",
+    "downhill",
+    "uphill",
+    "cycling",
     "stairs_up",
     "stairs_down",
-    "test",
-    "walking_test",
-    "cycling",
-    "uphill",
-    "downhill",
-    "imu_phase",
     "imu_left_phase",
-    "model_phase",
-    "imu_left_ao_phase",
-    "imu_ao_phase",
-    "walking_diff_test",
 ]
 
 

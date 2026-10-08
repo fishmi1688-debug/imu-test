@@ -181,10 +181,10 @@ def main():
 
     try:
         motor_controller.get_logger().info(
-            "🚀 CAN节点已初始化，默认开机自动进入有线IMU相位模式并启动助力"
+            "🚀 CAN节点已初始化，默认开机自动进入平地行走(walking)并启动助力"
         )
         
-        # 设置默认运动模式为有线IMU相位模式，稍后在本进程内自动完成启动流程。
+        # 设置默认运动模式为平地行走(walking)，稍后在本进程内自动完成启动流程。
         if not gait_analysis.set_motion_mode(boot_default_mode):
             motor_controller.get_logger().warn(
                 f"⚠️ 默认运动模式无效: {boot_default_mode}，回退到 imu_phase"
@@ -199,14 +199,14 @@ def main():
         print("⚠️ 重要提示:")
         print("   1. 当前按 RS01 私有运控 CAN 协议通信")
         print("   2. 左电机 CAN ID=1，右电机 CAN ID=2")
-        print("   3. 开机默认有线IMU相位模式会自动启动助力，不等待手机连接")
+        print("   3. 开机默认平地行走(walking)会自动启动助力，不等待手机连接")
         print("   4. 手机切换模式后助力会先停止，需由APP重新点击开始/手动助力")
         print("")
         print("📱 APP蓝牙控制命令示例:")
         print('   - 切换模式: {"t":3,"m":0}')
         print('   - 参数调整: {"t":4,"m":0,"u":[[4,3.2]]}')
         print('   - 紧急停止: {"t":5,"c":2}')
-        print('   - 下楼梯/测试手动启停: {"t":5,"c":3,"v":1}')
+        print('   - 手动助力启停: {"t":5,"c":3,"v":1}')
         print("🖥️ 终端将实时显示来自APP的操作命令与执行结果")
         print("="*50)
         
@@ -276,14 +276,6 @@ def main():
     }
     bt_plot_last_safe_initialized = set()
     bt_plot_last_safe_mode = None
-    bt_plot_max_angle_jump_deg = max(
-        0.0,
-        _read_env_float("GAIT_BT_PLOT_MAX_ANGLE_JUMP_DEG", 45.0),
-    )
-    bt_plot_max_velocity_jump_deg_s = max(
-        0.0,
-        _read_env_float("GAIT_BT_PLOT_MAX_VELOCITY_JUMP_DEG_S", 900.0),
-    )
     bt_plot_batch_size = max(1, int(os.environ.get("GAIT_BT_PLOT_BATCH_SIZE", "5")))
     bt_plot_every_n_frames = max(1, int(os.environ.get("GAIT_BT_PLOT_EVERY_N_FRAMES", "25")))
     bt_plot_mode = str(os.environ.get("GAIT_BT_PLOT_MODE", "batch")).strip().lower()
@@ -366,20 +358,13 @@ def main():
         os.environ.get("GAIT_BT_STATE_COMPACT_INCLUDE_PARAMS", "0") != "0"
     )
     bt_state_mode_order = (
-        "walking",
+        "imu_phase",
+        "downhill",
+        "uphill",
+        "cycling",
         "stairs_up",
         "stairs_down",
-        "test",
-        "walking_test",
-        "cycling",
-        "uphill",
-        "downhill",
-        "imu_phase",
         "imu_left_phase",
-        "model_phase",
-        "imu_left_ao_phase",
-        "imu_ao_phase",
-        "walking_diff_test",
     )
     bt_state_mode_to_code = {mode_key: idx for idx, mode_key in enumerate(bt_state_mode_order)}
     bt_msg_type_to_code = {
@@ -424,9 +409,6 @@ def main():
         "flex_p",
         "flex_Tmax",
         "phase_bias",
-        "phase_bias_at_0p6",
-        "phase_bias_slope",
-        "event_prob_threshold",
         "swing_threshold",
     )
     bt_param_key_to_code = {name: idx + 1 for idx, name in enumerate(bt_param_keys)}
@@ -497,7 +479,7 @@ def main():
     motor_active_report_last_desired = True
 
     def _desired_imu_measurement_slots() -> dict[str, bool]:
-        mode = str(getattr(gait_analysis, "current_motion_mode", "walking"))
+        mode = str(getattr(gait_analysis, "current_motion_mode", "imu_phase"))
         phase_uses_wired = bool(getattr(gait_analysis, "imu_phase_is_wired", False))
         keep_phase_streaming = _env_enabled(
             "GAIT_IMU_PHASE_KEEP_STREAMING",
@@ -526,7 +508,7 @@ def main():
                 "imu_phase_left": phase_left_keep,
                 "imu_phase_right": phase_right_keep,
             }
-        if mode in ("stairs_down", "test", "walking_test", "walking_diff_test"):
+        if mode == "stairs_down":
             return {
                 "walking": False,
                 "cycling": False,
@@ -534,7 +516,7 @@ def main():
                 "imu_phase_right": phase_right_keep,
             }
         return {
-            "walking": True,
+            "walking": False,
             "cycling": False,
             "imu_phase_left": phase_left_keep,
             "imu_phase_right": phase_right_keep,
@@ -544,7 +526,7 @@ def main():
         nonlocal imu_measurement_enabled_by_slot
         targets = _desired_imu_measurement_slots()
         changed = False
-        mode = str(getattr(gait_analysis, "current_motion_mode", "walking"))
+        mode = str(getattr(gait_analysis, "current_motion_mode", "imu_phase"))
         for slot_name, enabled in targets.items():
             if force or imu_measurement_enabled_by_slot.get(slot_name) != enabled:
                 if slot_name in ("imu_phase_left", "imu_phase_right") and enabled:
@@ -586,7 +568,7 @@ def main():
         nonlocal motor_active_report_enabled
         nonlocal motor_active_report_last_attempt_time
         nonlocal motor_active_report_last_desired
-        mode = str(getattr(gait_analysis, "current_motion_mode", "walking"))
+        mode = str(getattr(gait_analysis, "current_motion_mode", "imu_phase"))
         desired = mode not in IMU_PHASE_MODES
         if not force and motor_active_report_enabled == desired:
             motor_active_report_last_desired = desired
@@ -766,7 +748,7 @@ def main():
             return True
         left_command = float(last_left_motor_torque)
         right_command = float(last_right_motor_torque)
-        current_mode = str(getattr(gait_analysis, "current_motion_mode", "walking"))
+        current_mode = str(getattr(gait_analysis, "current_motion_mode", "imu_phase"))
         manual_assist_disabled = (
             current_mode in STAIRS_DOWN_MANUAL_MODES
             and not bool(getattr(gait_analysis, "stairs_down_manual_assist_enabled", False))
@@ -919,7 +901,7 @@ def main():
         gait_analysis.actual_left_torque = 0.0
         gait_analysis.actual_right_torque = 0.0
         gait_analysis.gait_state = 0
-        if str(getattr(gait_analysis, "current_motion_mode", "walking")) in STAIRS_DOWN_MANUAL_MODES:
+        if str(getattr(gait_analysis, "current_motion_mode", "imu_phase")) in STAIRS_DOWN_MANUAL_MODES:
             try:
                 gait_analysis.set_stairs_down_manual_assist(enabled=False)
             except Exception:
@@ -1365,9 +1347,6 @@ def main():
                 "flex_p": float(mode_params.get("flex_p", 0.0)),
                 "flex_Tmax": float(mode_params.get("flex_Tmax", 0.0)),
                 "phase_bias": float(mode_params.get("phase_bias", 0.0)),
-                "phase_bias_at_0p6": float(mode_params.get("phase_bias_at_0p6", 0.0)),
-                "phase_bias_slope": float(mode_params.get("phase_bias_slope", 0.0)),
-                "event_prob_threshold": float(mode_params.get("event_prob_threshold", 0.0)),
                 "swing_threshold": float(
                     mode_params.get("swing_threshold", 25.0)
                 ),
@@ -1406,7 +1385,7 @@ def main():
             mechanical_zero_ready: bool | None = None,
             motion_confirmed: bool | None = None,
         ) -> dict:
-            current_mode = str(getattr(gait_analysis, "current_motion_mode", "walking"))
+            current_mode = str(getattr(gait_analysis, "current_motion_mode", "imu_phase"))
             mode_params = _build_mode_params_payload(current_mode)
             if mechanical_zero_ready is None:
                 mechanical_zero_ready = bool(getattr(motor_controller, "mechanical_zeroed", False))
@@ -1479,7 +1458,7 @@ def main():
             mechanical_zero_ready: bool | None = None,
             motion_confirmed: bool | None = None,
         ) -> dict:
-            current_mode = str(getattr(gait_analysis, "current_motion_mode", "walking"))
+            current_mode = str(getattr(gait_analysis, "current_motion_mode", "imu_phase"))
             if mechanical_zero_ready is None:
                 mechanical_zero_ready = bool(getattr(motor_controller, "mechanical_zeroed", False))
             if motion_confirmed is None:
@@ -1665,7 +1644,7 @@ def main():
             )
 
         def _is_test_peak_mode(mode_key: str) -> bool:
-            return mode_key in ("test", "walking_test", "walking_diff_test")
+            return False
 
         def _select_plot_phase_and_assist(
             phase_left: float,
@@ -1673,7 +1652,7 @@ def main():
             assist_left: float,
             assist_right: float,
         ) -> tuple[float, float]:
-            current_mode = str(getattr(gait_analysis, "current_motion_mode", "walking"))
+            current_mode = str(getattr(gait_analysis, "current_motion_mode", "imu_phase"))
             if not _is_test_peak_mode(current_mode):
                 return float(phase_left), float(assist_left)
 
@@ -1751,7 +1730,7 @@ def main():
                 assist_left=assist_left,
                 assist_right=assist_right,
             )
-            current_mode = str(getattr(gait_analysis, "current_motion_mode", "walking"))
+            current_mode = str(getattr(gait_analysis, "current_motion_mode", "imu_phase"))
             if current_mode != bt_plot_last_safe_mode:
                 bt_plot_last_safe_initialized.clear()
                 bt_plot_last_safe_mode = current_mode
@@ -1771,28 +1750,24 @@ def main():
                     "l",
                     getattr(gait_analysis, "imu_phase_left_angle_deg", plot_left_angle),
                     max_abs=_plot_display_limit("left", "angle"),
-                    max_jump=bt_plot_max_angle_jump_deg,
                     hold_previous=imu_phase_abnormal,
                 )
                 plot_right_angle = _plot_safe_value(
                     "r",
                     getattr(gait_analysis, "imu_phase_right_angle_deg", plot_right_angle),
                     max_abs=_plot_display_limit("right", "angle"),
-                    max_jump=bt_plot_max_angle_jump_deg,
                     hold_previous=imu_phase_abnormal,
                 )
                 plot_left_velocity = _plot_safe_value(
                     "lv",
                     getattr(gait_analysis, "imu_phase_left_angular_velocity_deg_s", 0.0),
                     max_abs=_plot_display_limit("left", "gyro"),
-                    max_jump=bt_plot_max_velocity_jump_deg_s,
                     hold_previous=imu_phase_abnormal,
                 )
                 plot_right_velocity = _plot_safe_value(
                     "rv",
                     getattr(gait_analysis, "imu_phase_right_angular_velocity_deg_s", 0.0),
                     max_abs=_plot_display_limit("right", "gyro"),
-                    max_jump=bt_plot_max_velocity_jump_deg_s,
                     hold_previous=imu_phase_abnormal,
                 )
             else:
@@ -2196,7 +2171,7 @@ def main():
                 return _json_response(response)
             if msg_type == "set_params":
                 requested_mode = _decode_mode_from_payload(payload)
-                current_mode = str(getattr(gait_analysis, "current_motion_mode", "walking"))
+                current_mode = str(getattr(gait_analysis, "current_motion_mode", "imu_phase"))
                 allow_offmode = _coerce_bool(
                     payload.get("ao", payload.get("allow_offmode", False)),
                     default=False,
@@ -2367,7 +2342,7 @@ def main():
                     except Exception:
                         name = ""
                 if name in ("start_assist", "start"):
-                    current_mode = str(getattr(gait_analysis, "current_motion_mode", "walking"))
+                    current_mode = str(getattr(gait_analysis, "current_motion_mode", "imu_phase"))
                     manual_mode = current_mode in STAIRS_DOWN_MANUAL_MODES
                     motor_active_report = current_mode not in IMU_PHASE_MODES
                     feedback_ok = True
@@ -2487,7 +2462,7 @@ def main():
                         }
                     )
                 if name == "motor_enable":
-                    current_mode = str(getattr(gait_analysis, "current_motion_mode", "walking"))
+                    current_mode = str(getattr(gait_analysis, "current_motion_mode", "imu_phase"))
                     motor_active_report = current_mode not in IMU_PHASE_MODES
                     if not motor_active_report:
                         _sync_motor_active_report_for_mode(force=True)
@@ -2536,7 +2511,7 @@ def main():
                     )
                     if target_enabled and not app_runtime_enabled:
                         resolved_mode = str(
-                            getattr(gait_analysis, "current_motion_mode", "walking")
+                            getattr(gait_analysis, "current_motion_mode", "imu_phase")
                         )
                         resolved_mode_code = bt_state_mode_to_code.get(resolved_mode, -1)
                         reason = "manual_prepare_failed"
@@ -2588,7 +2563,7 @@ def main():
                     last_right_motor_torque = 0.0
                     last_imu_motor_command_time = 0.0
                     last_torque_filter_time = 0.0
-                    if str(getattr(gait_analysis, "current_motion_mode", "walking")) in STAIRS_DOWN_MANUAL_MODES:
+                    if str(getattr(gait_analysis, "current_motion_mode", "imu_phase")) in STAIRS_DOWN_MANUAL_MODES:
                         gait_analysis.set_stairs_down_manual_assist(enabled=False)
                     motor_controller.emergency_stop()
                     motor_controller.get_logger().info("📱 APP操作: command emergency_stop")
@@ -2647,7 +2622,7 @@ def main():
             last_bt_client_connected = bt_client_connected
 
             _sync_imu_measurement_for_mode()
-            current_motion_mode = str(getattr(gait_analysis, "current_motion_mode", "walking"))
+            current_motion_mode = str(getattr(gait_analysis, "current_motion_mode", "imu_phase"))
             imu_phase_mode = current_motion_mode in IMU_PHASE_MODES
             _sync_motor_active_report_for_mode()
             motor_feedback_mode = bool(app_runtime_enabled and not imu_phase_mode)
@@ -3068,21 +3043,14 @@ def main():
                 
                 # 记录数据到CSV文件
                 if lhip_angle is not None and rhip_angle is not None:
-                    # 获取当前相位值（测试/IMU模式使用各自已计算的右腿相位，其它模式右腿=左腿+π）
+                    # 获取当前相位值（IMU模式使用已计算的右腿相位，其它模式右腿=左腿+π）
                     phase_left_raw = float(getattr(gait_analysis, "phi_L", 0.0))
                     try:
                         phase_left = gait_analysis._wrap_to_2pi(phase_left_raw)
                     except Exception:
                         phase_left = phase_left_raw
                     try:
-                        if (
-                            getattr(gait_analysis, "current_motion_mode", "") in (
-                                "test",
-                                "walking_test",
-                                "walking_diff_test",
-                            )
-                            or getattr(gait_analysis, "current_motion_mode", "") in IMU_PHASE_MODES
-                        ):
+                        if getattr(gait_analysis, "current_motion_mode", "") in IMU_PHASE_MODES:
                             phase_right_raw = float(
                                 getattr(gait_analysis, "current_right_phase", phase_left + np.pi)
                             )

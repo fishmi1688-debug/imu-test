@@ -39,20 +39,13 @@ object GaitProtocol {
     const val STREAM_PLOT_MODE_SAMPLE = 1
 
     private val modeKeys = listOf(
-        "walking",
+        "imu_phase",
+        "downhill",
+        "uphill",
+        "cycling",
         "stairs_up",
         "stairs_down",
-        "test",
-        "walking_test",
-        "cycling",
-        "uphill",
-        "downhill",
-        "imu_phase",
         "imu_left_phase",
-        "model_phase",
-        "imu_left_ao_phase",
-        "imu_ao_phase",
-        "walking_diff_test",
     )
 
     private val messageTypeCodeToText = mapOf(
@@ -122,9 +115,6 @@ object GaitProtocol {
         "flex_p",
         "flex_Tmax",
         "phase_bias",
-        "phase_bias_at_0p6",
-        "phase_bias_slope",
-        "event_prob_threshold",
         "swing_threshold",
     )
 

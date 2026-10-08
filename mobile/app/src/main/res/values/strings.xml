@@ -27,9 +27,6 @@
     <string name="ui_text_010">flex_t0 (0-1)</string>
     <string name="ui_text_011">flex_tf (0-1)</string>
     <string name="ui_text_012">phase_bias (-0.5 到 0.5)</string>
-    <string name="ui_text_013">phase_bias_at_0p6 (-0.5 到 0.5)</string>
-    <string name="ui_text_014">phase_bias_slope (-10 到 10)</string>
-    <string name="ui_text_015">event_prob_threshold (0-1)</string>
     <string name="ui_text_016">与 gait_control GUI 参数保持一致</string>
     <string name="ui_text_017">亮度 (0-15)</string>
     <string name="ui_text_018">伸展阶段参数</string>
@@ -60,7 +57,6 @@
     <string name="ui_text_043">检查蓝牙连接</string>
     <string name="ui_text_044">模式描述</string>
     <string name="ui_text_045">步态参数面板</string>
-    <string name="ui_text_046">步态检测参数</string>
     <string name="ui_text_047">状态</string>
     <string name="ui_text_048">状态: 未初始化</string>
     <string name="ui_text_049">状态: 未开始</string>
@@ -108,8 +104,8 @@
     <string name="ui_text_091">蓝线为总助力，绿线为伸展，橙线为屈曲。当前伸展/屈曲最大力矩均为 0，预览会显示为零线；拖动左侧力矩滑块后可直接看到形状变化。</string>
     <string name="ui_text_092">蓝线为总助力，绿线为伸展，橙线为屈曲。\n抬腿助力：%1$s Nm\n压腿助力：%2$s Nm\n相位偏置：%3$s</string>
     <string name="ui_text_093">暂无助力曲线</string>
-    <string name="ui_text_094">下楼梯/测试手动启停</string>
-    <string name="ui_text_095">下楼梯、测试与IMU相位类模式不使用IMU模型自动判停；“开始传输并启动系统”仅启动系统，不会直接开助力，请使用此按钮手动启停助力。</string>
+    <string name="ui_text_094">手动助力启停</string>
+    <string name="ui_text_095">当前保留模式使用手动启停；“开始传输并启动系统”仅启动系统，不会直接开助力，请使用此按钮手动启停助力。</string>
     <string name="ui_text_096">开始手动助力</string>
     <string name="ui_text_097">停止手动助力</string>
     <string name="ui_text_098">点击开始后会重新使能电机、执行机械标零并启动系统传输；普通模式会配置并检查电机 50Hz 主动上报，IMU相位类模式不启用也不检查电机主动上报。是否输出助力由手动启停按钮或IMU运动判定决定。</string>

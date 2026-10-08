@@ -6,7 +6,6 @@ import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.view.View
-import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.widget.ArrayAdapter
 import android.widget.AutoCompleteTextView
@@ -36,29 +35,26 @@ class GaitParameterActivity : AppCompatActivity() {
         private const val BATTERY_REFRESH_INTERVAL_MS = 15000L
         private const val STATE_FLAG_STAIRS_DOWN_MANUAL_ASSIST = 2
         private val COMPACT_MODE_KEYS = listOf(
-            "walking",
+            "imu_phase",
+            "downhill",
+            "uphill",
+            "cycling",
             "stairs_up",
             "stairs_down",
-            "test",
-            "walking_test",
-            "cycling",
-            "uphill",
-            "downhill",
-            "imu_phase",
             "imu_left_phase",
-            "model_phase",
-            "imu_left_ao_phase",
-            "imu_ao_phase",
-            "walking_diff_test",
         )
         private val IMU_PHASE_MODE_KEYS = setOf(
             "imu_phase",
+            "downhill",
+            "uphill",
+            "cycling",
+            "stairs_up",
+            "stairs_down",
             "imu_left_phase",
-            "imu_left_ao_phase",
-            "imu_ao_phase",
         )
-        private val MODEL_PHASE_MODE_KEYS = setOf("model_phase")
+        private val MODEL_PHASE_MODE_KEYS = emptySet<String>()
         private val WIRED_PHASE_MODE_KEYS = IMU_PHASE_MODE_KEYS + MODEL_PHASE_MODE_KEYS
+        private val LEFT_STYLE_PHASE_BIAS_MODE_KEYS = IMU_PHASE_MODE_KEYS
     }
 
     private data class ParamSpec(
@@ -84,9 +80,6 @@ class GaitParameterActivity : AppCompatActivity() {
         "flex_p" to ParamSpec(min = 0.0, max = 1.0, step = 0.01, decimals = 3),
         "flex_Tmax" to ParamSpec(min = 0.0, max = 17.0, step = 0.1, decimals = 1),
         "phase_bias" to ParamSpec(min = -0.5, max = 0.5, step = 0.01, decimals = 3),
-        "phase_bias_at_0p6" to ParamSpec(min = -0.5, max = 0.5, step = 0.01, decimals = 3),
-        "phase_bias_slope" to ParamSpec(min = -10.0, max = 10.0, step = 0.05, decimals = 3),
-        "event_prob_threshold" to ParamSpec(min = 0.0, max = 1.0, step = 0.05, decimals = 2),
         "swing_threshold" to ParamSpec(min = 0.0, max = 90.0, step = 1.0, decimals = 1)
     )
 
@@ -131,24 +124,18 @@ class GaitParameterActivity : AppCompatActivity() {
     }
 
     private fun isManualToggleMode(modeKey: String): Boolean {
-        return modeKey == "stairs_down" ||
-            modeKey == "test" ||
-            modeKey == "walking_test" ||
-            modeKey == "walking_diff_test" ||
-            modeKey in WIRED_PHASE_MODE_KEYS
+        return modeKey in WIRED_PHASE_MODE_KEYS
     }
 
     private fun manualToggleModeLabel(modeKey: String): String {
         return when (modeKey) {
+            "imu_phase" -> "平地行走"
+            "downhill" -> "下坡行走"
+            "uphill" -> "上坡行走"
+            "cycling" -> "骑自行车"
+            "stairs_up" -> "上楼梯"
             "stairs_down" -> "下楼梯"
-            "test" -> "骑车测试模式"
-            "walking_test" -> "步行测试模式"
-            "walking_diff_test" -> "步行差分测试模式"
-            "imu_phase" -> "有线IMU相位模式"
-            "imu_left_phase" -> "左有线IMU相位模式"
-            "model_phase" -> "模型相位模式"
-            "imu_left_ao_phase" -> "左有线IMU自适应振荡相位模式"
-            "imu_ao_phase" -> "有线IMU自适应振荡相位模式"
+            "imu_left_phase" -> "test"
             else -> "手动模式"
         }
     }
@@ -380,7 +367,7 @@ class GaitParameterActivity : AppCompatActivity() {
             return
         }
 
-        if (mode != "walking" && mode != "cycling") {
+        if (mode != "cycling") {
             return
         }
         val phaseBias = obj.doubleOrNull("phase_bias") ?: return
@@ -519,21 +506,6 @@ class GaitParameterActivity : AppCompatActivity() {
             plusButton = findViewById(R.id.phaseBiasPlusButton),
             valueView = findViewById(R.id.phaseBiasValueView)
         )
-        paramViews["phase_bias_at_0p6"] = ParamViews(
-            minusButton = findViewById(R.id.phaseBias0p6MinusButton),
-            plusButton = findViewById(R.id.phaseBias0p6PlusButton),
-            valueView = findViewById(R.id.phaseBias0p6ValueView)
-        )
-        paramViews["phase_bias_slope"] = ParamViews(
-            minusButton = findViewById(R.id.phaseBiasSlopeMinusButton),
-            plusButton = findViewById(R.id.phaseBiasSlopePlusButton),
-            valueView = findViewById(R.id.phaseBiasSlopeValueView)
-        )
-        paramViews["event_prob_threshold"] = ParamViews(
-            minusButton = findViewById(R.id.rTMinusButton),
-            plusButton = findViewById(R.id.rTPlusButton),
-            valueView = findViewById(R.id.rTValueView)
-        )
         paramViews["swing_threshold"] = ParamViews(
             minusButton = findViewById(R.id.swingThresholdMinusButton),
             plusButton = findViewById(R.id.swingThresholdPlusButton),
@@ -648,7 +620,7 @@ class GaitParameterActivity : AppCompatActivity() {
 
     private fun sendStairsDownAssistToggle() {
         if (!isManualToggleMode(currentModeKey)) {
-            showStatus("请先切换到下楼梯、骑车测试模式、步行测试模式、IMU相位模式或模型相位模式")
+            showStatus("当前模式不支持手动助力启停")
             return
         }
         val targetEnabled = !stairsDownAssistEnabled
@@ -684,13 +656,8 @@ class GaitParameterActivity : AppCompatActivity() {
 
     private fun updateModeUiState(modeKey: String, manualAssistEnabled: Boolean) {
         currentModeKey = modeKey
-        val interpolationEnabled = modeKey == "walking" || modeKey == "cycling"
-        val eventThresholdEnabled = modeKey == "cycling" || modeKey == "uphill"
         val swingThresholdVisible = modeKey in IMU_PHASE_MODE_KEYS
         val stairsDownManualToggleVisible = isManualToggleMode(modeKey)
-        setRowEnabled(findViewById(R.id.phaseBias0p6Row), interpolationEnabled)
-        setRowEnabled(findViewById(R.id.phaseBiasSlopeRow), interpolationEnabled)
-        setRowEnabled(findViewById(R.id.eventProbThresholdRow), eventThresholdEnabled)
         findViewById<View>(R.id.swingThresholdRow).visibility =
             if (swingThresholdVisible && detailParamsVisible) View.VISIBLE else View.GONE
         stairsDownToggleCard.visibility = if (stairsDownManualToggleVisible) View.VISIBLE else View.GONE
@@ -824,9 +791,6 @@ class GaitParameterActivity : AppCompatActivity() {
         setParamValue("flex_Tmax", values["flex_Tmax"] ?: 0.0, updatePreview = false)
 
         setParamValue("phase_bias", values["phase_bias"] ?: 0.0, updatePreview = false)
-        setParamValue("phase_bias_at_0p6", values["phase_bias_at_0p6"] ?: 0.0, updatePreview = false)
-        setParamValue("phase_bias_slope", values["phase_bias_slope"] ?: 0.0, updatePreview = false)
-        setParamValue("event_prob_threshold", values["event_prob_threshold"] ?: 0.0, updatePreview = false)
         setParamValue("swing_threshold", values["swing_threshold"] ?: 25.0, updatePreview = false)
 
         updateModeUiState(modeKey, manualAssistEnabled)
@@ -850,9 +814,6 @@ class GaitParameterActivity : AppCompatActivity() {
             "flex_p" to mode.flexP,
             "flex_Tmax" to mode.flexTmax,
             "phase_bias" to mode.phaseBias,
-            "phase_bias_at_0p6" to mode.phaseBiasAt0p6,
-            "phase_bias_slope" to mode.phaseBiasSlope,
-            "event_prob_threshold" to mode.eventProbThreshold,
             "swing_threshold" to mode.swingThreshold
         )
     }
@@ -924,20 +885,6 @@ class GaitParameterActivity : AppCompatActivity() {
         return BigDecimal(snapped).setScale(spec.decimals, RoundingMode.HALF_UP).toDouble()
     }
 
-    private fun setRowEnabled(view: View, enabled: Boolean) {
-        view.alpha = if (enabled) 1.0f else 0.45f
-        setEnabledRecursively(view, enabled)
-    }
-
-    private fun setEnabledRecursively(view: View, enabled: Boolean) {
-        view.isEnabled = enabled
-        if (view is ViewGroup) {
-            for (index in 0 until view.childCount) {
-                setEnabledRecursively(view.getChildAt(index), enabled)
-            }
-        }
-    }
-
     private fun setupAssistCurveEditor() {
         assistCurveEditorView = findViewById(R.id.assistCurveEditorView)
         assistCurveSummaryView = findViewById(R.id.assistCurveSummaryView)
@@ -981,7 +928,9 @@ class GaitParameterActivity : AppCompatActivity() {
             return
         }
         val params = currentAssistPreviewParams() ?: return
-        assistCurveEditorView.setLeftWiredImuPhaseBiasStyle(currentModeKey == "imu_left_phase")
+        assistCurveEditorView.setLeftWiredImuPhaseBiasStyle(
+            currentModeKey in LEFT_STYLE_PHASE_BIAS_MODE_KEYS
+        )
         assistCurveEditorView.setParams(params)
         val summary = AssistCurveMath.sample(params)
 

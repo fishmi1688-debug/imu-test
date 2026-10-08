@@ -43,38 +43,30 @@ object GaitBluetoothBridge {
     private const val FLAG_IMU_PHASE_MOTION_ACTIVE = 24
     private const val MAX_PLOT_ANGLE_ABS = 360f
     private const val MAX_PLOT_IMU_ANGLE_ABS = 170f
-    private const val MAX_PLOT_IMU_ANGLE_JUMP = 45f
     private const val MAX_PLOT_VELOCITY_ABS = 2000f
-    private const val MAX_PLOT_IMU_VELOCITY_JUMP = 900f
     private const val MAX_PLOT_ASSIST_ABS = 17f
     private val TWO_PI = (2.0 * PI).toFloat()
 
     private val COMPACT_MODE_KEYS = listOf(
-        "walking",
+        "imu_phase",
+        "downhill",
+        "uphill",
+        "cycling",
         "stairs_up",
         "stairs_down",
-        "test",
-        "walking_test",
-        "cycling",
-        "uphill",
-        "downhill",
-        "imu_phase",
         "imu_left_phase",
-        "model_phase",
-        "imu_left_ao_phase",
-        "imu_ao_phase",
-        "walking_diff_test",
     )
     private val IMU_PHASE_MODE_KEYS = setOf(
         "imu_phase",
+        "downhill",
+        "uphill",
+        "cycling",
+        "stairs_up",
+        "stairs_down",
         "imu_left_phase",
-        "model_phase",
-        "imu_left_ao_phase",
-        "imu_ao_phase",
     )
     private val LEFT_ONLY_IMU_PHASE_MODE_KEYS = setOf(
         "imu_left_phase",
-        "imu_left_ao_phase",
     )
 
     data class PlotFrame(
@@ -345,29 +337,21 @@ object GaitBluetoothBridge {
             frame.rightAngularVelocity != null ||
             frame.rightAssist != null
         val angleMaxAbs = if (isImuPhaseMode) MAX_PLOT_IMU_ANGLE_ABS else MAX_PLOT_ANGLE_ABS
-        val angleJump = if (isImuPhaseMode) MAX_PLOT_IMU_ANGLE_JUMP else 0f
-        val velocityJump = if (isImuPhaseMode) MAX_PLOT_IMU_VELOCITY_JUMP else 0f
         return frame.copy(
             leftAngle = finiteOrFallback(
                 frame.leftAngle,
                 previous?.leftAngle ?: 0f,
                 angleMaxAbs,
-                maxJump = angleJump,
-                rejectJump = previous != null,
             ),
             rightAngle = finiteOrFallback(
                 frame.rightAngle,
                 previous?.rightAngle ?: 0f,
                 angleMaxAbs,
-                maxJump = angleJump,
-                rejectJump = previous != null,
             ),
             angleDiff = finiteOrFallback(
                 frame.angleDiff,
                 previous?.angleDiff ?: 0f,
                 angleMaxAbs * 2f,
-                maxJump = angleJump * 2f,
-                rejectJump = previous != null,
             ),
             phase = normalizePhaseRad(frame.phase, previous?.phase ?: 0f),
             assist = finiteOrFallback(
@@ -380,8 +364,6 @@ object GaitBluetoothBridge {
                     it,
                     previous?.leftAngularVelocity ?: 0f,
                     MAX_PLOT_VELOCITY_ABS,
-                    maxJump = velocityJump,
-                    rejectJump = previous?.leftAngularVelocity != null,
                 )
             },
             rightAngularVelocity = frame.rightAngularVelocity?.let {
@@ -389,8 +371,6 @@ object GaitBluetoothBridge {
                     it,
                     previous?.rightAngularVelocity ?: 0f,
                     MAX_PLOT_VELOCITY_ABS,
-                    maxJump = velocityJump,
-                    rejectJump = previous?.rightAngularVelocity != null,
                 )
             },
             rightAssist = frame.rightAssist?.let {

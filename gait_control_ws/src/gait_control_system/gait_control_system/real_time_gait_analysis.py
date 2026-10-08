@@ -8,18 +8,10 @@ from datetime import datetime
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.parameter import Parameter
 from rcl_interfaces.msg import ParameterDescriptor, ParameterType
 from std_msgs.msg import Float32
 
 from .adaptive_oscillator_estimator import AdaptiveOscillatorEstimator
-from .gait_model_phase_estimator import (
-    DEFAULT_MODEL_PHASE_MODEL_PATH,
-    DEFAULT_MODEL_PHASE_SCALER_PATH,
-    MODEL_PHASE_SAMPLE_RATE_HZ,
-    MODEL_PHASE_WINDOW_N,
-    RealtimeOnnxGaitPhaseEstimator,
-)
 from .hip_style_imu_phase_estimator import HipStyleImuPhaseEstimator
 from .imu_phase_estimator import ImuPhaseConfig, ImuPhaseOutput, ThighImuPhaseEstimator
 from .gait_constants import AO_CONFIG, CAN_INTERFACE
@@ -30,7 +22,6 @@ from .mi1_imu_phase_source import (
     format_node_id as format_mi1_node_id,
 )
 from .motion_mode_defaults import get_default_motion_modes
-from .phase_bias_fitting import phase_bias_with_smoothing
 from .sen0694_imu_phase_source import (
     DEFAULT_I2C_ADAPTER_NAME as DEFAULT_IMU_PHASE_I2C_ADAPTER_NAME,
     DEFAULT_SEN0694_RATE_HZ,
@@ -51,15 +42,16 @@ from .test_mode_phase_helper import (
 
 CYCLING_TOGGLE_MODES = ("cycling", "uphill")
 ACTIVITY_IMU_PHASE_MODES = ("stairs_up", "stairs_down", "cycling", "uphill", "downhill")
-TEST_PEAK_PHASE_MODES = ("test", "walking_test")
-DIFF_PEAK_PHASE_MODES = ("walking_diff_test",)
+TEST_PEAK_PHASE_MODES = ()
+DIFF_PEAK_PHASE_MODES = ()
 MOTOR_PEAK_PHASE_MODES = (*TEST_PEAK_PHASE_MODES, *DIFF_PEAK_PHASE_MODES)
-IMU_AO_PHASE_MODES = ("imu_left_ao_phase", "imu_ao_phase")
-DUAL_IMU_PHASE_MODES = ("imu_phase", "imu_ao_phase", *ACTIVITY_IMU_PHASE_MODES)
-SINGLE_IMU_PHASE_MODES = ("imu_left_phase", "imu_left_ao_phase")
-MODEL_PHASE_MODES = ("model_phase",)
+IMU_AO_PHASE_MODES = ()
+HIP_STYLE_DIFF_PHASE_MODES = ("imu_phase", *ACTIVITY_IMU_PHASE_MODES)
+DUAL_IMU_PHASE_MODES = ("imu_phase", *ACTIVITY_IMU_PHASE_MODES)
+SINGLE_IMU_PHASE_MODES = ("imu_left_phase",)
+MODEL_PHASE_MODES = ()
 IMU_PHASE_MODES = (*DUAL_IMU_PHASE_MODES, *SINGLE_IMU_PHASE_MODES, *MODEL_PHASE_MODES)
-STAIRS_DOWN_MANUAL_MODES = ("stairs_down", *MOTOR_PEAK_PHASE_MODES, *IMU_PHASE_MODES)
+STAIRS_DOWN_MANUAL_MODES = IMU_PHASE_MODES
 DEFAULT_IMU_PHASE_SWING_THRESHOLD_DEG = 25.0
 DEFAULT_IMU_PHASE_LEFT_MAC = "D4:22:CD:00:84:61"
 DEFAULT_IMU_PHASE_RIGHT_MAC = "D4:22:CD:00:83:98"
@@ -112,7 +104,6 @@ VALID_IMU_PHASE_SIGNED_AXES = {
     "-2",
 }
 VALID_IMU_PHASE_ANGLE_SOURCES = {"acc", "quat_x", "quat_y", "quat_z", "quat_sagittal"}
-DEFAULT_EVENT_PROB_THRESHOLD = 0.8
 
 # 相位输入/停止态预览门控（便于集中调参）
 PHASE_PREVIEW_WINDOW_SEC = 0.5       # 门控RMS统计窗口时长（秒）
@@ -199,12 +190,12 @@ class RealTimeGaitAnalysis(Node):
         self.hipAss = deque(maxlen=buffer_size)        # 助力力矩缓存（保持向后兼容）
 
         # 当前运动模式
-        self.current_motion_mode = "walking"  # 默认为行走模式
+        self.current_motion_mode = "imu_phase"  # 默认保留的平地行走(walking)模式
         
         # 定义不同运动模式的五次多项式助力曲线参数
         # 统一从 motion_mode_defaults 中加载，方便全局修改默认值
         self.motion_modes = get_default_motion_modes()
-        self.dynamic_phase_bias = self.motion_modes.get("walking", {}).get("phase_bias", 0.0)
+        self.dynamic_phase_bias = self.motion_modes.get("imu_phase", {}).get("phase_bias", 0.0)
         self.phase_bias_pub = self.create_publisher(Float32, "/phase_bias/adjusted", 10)
         
         # 自适应振荡器（与 analyze_motor_angles.py 对齐）
@@ -272,17 +263,19 @@ class RealTimeGaitAnalysis(Node):
         self.peak_state_L = 'rising'  # 左腿峰值检测状态 ('rising', 'falling')
         self.peak_state_R = 'rising'  # 右腿峰值检测状态
 
-        # test模式：不使用AO，基于左右髋角峰值独立估计助力时序
+        # 旧峰值测试模式已从可选模式移除；仅在重新启用时才初始化对应跟踪器。
         self.test_mode_phase_min_cycle = TEST_MODE_PHASE_MIN_CYCLE_SEC
         self.test_mode_phase_max_cycle = TEST_MODE_PHASE_MAX_CYCLE_SEC
         self.test_mode_peak_slope_eps = TEST_MODE_PEAK_SLOPE_EPS
-        self.test_mode_phase_tracker = TestModePhaseTracker(
-            min_cycle_sec=self.test_mode_phase_min_cycle,
-            max_cycle_sec=self.test_mode_phase_max_cycle,
-            peak_slope_eps=self.test_mode_peak_slope_eps,
-            peak_threshold=self.peak_threshold,
-            estimated_human_frequency=self.estimated_human_frequency,
-        )
+        self.test_mode_phase_tracker = None
+        if MOTOR_PEAK_PHASE_MODES:
+            self.test_mode_phase_tracker = TestModePhaseTracker(
+                min_cycle_sec=self.test_mode_phase_min_cycle,
+                max_cycle_sec=self.test_mode_phase_max_cycle,
+                peak_slope_eps=self.test_mode_peak_slope_eps,
+                peak_threshold=self.peak_threshold,
+                estimated_human_frequency=self.estimated_human_frequency,
+            )
         self.test_mode_left_phase_valid = False
         self.test_mode_right_phase_valid = False
         self.test_mode_left_assist_ready = False
@@ -744,6 +737,16 @@ class RealTimeGaitAnalysis(Node):
                 ),
             ),
         )
+        self.imu_phase_diff_hip_style_estimator = HipStyleImuPhaseEstimator(
+            self.imu_phase_diff_estimator.config,
+            sample_rate_hz=max(
+                1.0,
+                _read_env_float(
+                    "GAIT_IMU_PHASE_DIFF_HIP_STYLE_RATE_HZ",
+                    50.0 if self.imu_phase_is_wired else 30.0,
+                ),
+            ),
+        )
         self.imu_phase_last_left_seq = 0
         self.imu_phase_last_right_seq = 0
         self.imu_phase_last_diff_left_seq = 0
@@ -814,55 +817,69 @@ class RealTimeGaitAnalysis(Node):
         self.model_phase_stride_rate_hz = 0.0
         self.model_phase_last_left_seq = 0
         self.model_phase_last_right_seq = 0
-        self.model_phase_model_path = os.environ.get(
-            "GAIT_MODEL_PHASE_MODEL_PATH",
-            str(DEFAULT_MODEL_PHASE_MODEL_PATH),
-        )
-        self.model_phase_scaler_path = os.environ.get(
-            "GAIT_MODEL_PHASE_SCALER_PATH",
-            str(DEFAULT_MODEL_PHASE_SCALER_PATH),
-        )
-        self.model_phase_sample_rate_hz = max(
-            1.0,
-            _read_env_float(
-                "GAIT_MODEL_PHASE_SAMPLE_RATE_HZ",
+        self.model_phase_model_path = ""
+        self.model_phase_scaler_path = ""
+        self.model_phase_sample_rate_hz = 0.0
+        self.model_phase_angle_lpf_cutoff_hz = 0.0
+        self.model_phase_window_size = 0
+        if MODEL_PHASE_MODES:
+            from .gait_model_phase_estimator import (
+                DEFAULT_MODEL_PHASE_MODEL_PATH,
+                DEFAULT_MODEL_PHASE_SCALER_PATH,
                 MODEL_PHASE_SAMPLE_RATE_HZ,
-            ),
-        )
-        self.model_phase_angle_lpf_cutoff_hz = max(
-            0.0,
-            _read_env_float(
-                "GAIT_MODEL_PHASE_ANGLE_LPF_CUTOFF_HZ",
-                common_imu_phase_angle_lpf_cutoff_hz,
-            ),
-        )
-        try:
-            self.model_phase_window_size = max(
-                2,
-                int(os.environ.get("GAIT_MODEL_PHASE_WINDOW_N", str(MODEL_PHASE_WINDOW_N))),
+                MODEL_PHASE_WINDOW_N,
+                RealtimeOnnxGaitPhaseEstimator,
             )
-        except Exception:
-            self.model_phase_window_size = MODEL_PHASE_WINDOW_N
-        try:
-            self.model_phase_estimator = RealtimeOnnxGaitPhaseEstimator(
-                model_path=self.model_phase_model_path,
-                scaler_path=self.model_phase_scaler_path,
-                sample_rate_hz=self.model_phase_sample_rate_hz,
-                window_size=self.model_phase_window_size,
-                angle_lowpass_cutoff_hz=self.model_phase_angle_lpf_cutoff_hz,
+
+            self.model_phase_model_path = os.environ.get(
+                "GAIT_MODEL_PHASE_MODEL_PATH",
+                str(DEFAULT_MODEL_PHASE_MODEL_PATH),
             )
-            self.get_logger().info(
-                "模型相位估计器已就绪: "
-                f"model={self.model_phase_model_path}, "
-                f"scaler={self.model_phase_scaler_path}, "
-                f"rate={self.model_phase_sample_rate_hz:.1f}Hz, "
-                f"window={self.model_phase_window_size}, "
-                f"angle_lpf={self.model_phase_angle_lpf_cutoff_hz:.2f}Hz"
+            self.model_phase_scaler_path = os.environ.get(
+                "GAIT_MODEL_PHASE_SCALER_PATH",
+                str(DEFAULT_MODEL_PHASE_SCALER_PATH),
             )
-        except Exception as exc:
-            self.model_phase_init_error = str(exc)
-            self.model_phase_estimator = None
-            self.get_logger().warn(f"模型相位估计器初始化失败: {exc}")
+            self.model_phase_sample_rate_hz = max(
+                1.0,
+                _read_env_float(
+                    "GAIT_MODEL_PHASE_SAMPLE_RATE_HZ",
+                    MODEL_PHASE_SAMPLE_RATE_HZ,
+                ),
+            )
+            self.model_phase_angle_lpf_cutoff_hz = max(
+                0.0,
+                _read_env_float(
+                    "GAIT_MODEL_PHASE_ANGLE_LPF_CUTOFF_HZ",
+                    common_imu_phase_angle_lpf_cutoff_hz,
+                ),
+            )
+            try:
+                self.model_phase_window_size = max(
+                    2,
+                    int(os.environ.get("GAIT_MODEL_PHASE_WINDOW_N", str(MODEL_PHASE_WINDOW_N))),
+                )
+            except Exception:
+                self.model_phase_window_size = MODEL_PHASE_WINDOW_N
+            try:
+                self.model_phase_estimator = RealtimeOnnxGaitPhaseEstimator(
+                    model_path=self.model_phase_model_path,
+                    scaler_path=self.model_phase_scaler_path,
+                    sample_rate_hz=self.model_phase_sample_rate_hz,
+                    window_size=self.model_phase_window_size,
+                    angle_lowpass_cutoff_hz=self.model_phase_angle_lpf_cutoff_hz,
+                )
+                self.get_logger().info(
+                    "模型相位估计器已就绪: "
+                    f"model={self.model_phase_model_path}, "
+                    f"scaler={self.model_phase_scaler_path}, "
+                    f"rate={self.model_phase_sample_rate_hz:.1f}Hz, "
+                    f"window={self.model_phase_window_size}, "
+                    f"angle_lpf={self.model_phase_angle_lpf_cutoff_hz:.2f}Hz"
+                )
+            except Exception as exc:
+                self.model_phase_init_error = str(exc)
+                self.model_phase_estimator = None
+                self.get_logger().warn(f"模型相位估计器初始化失败: {exc}")
         
         # 步态开始/结束检测参数（仅使用IMU模型）
         self.timer_r = 0.0  # 仅用于调试输出
@@ -1277,59 +1294,6 @@ class RealTimeGaitAnalysis(Node):
             )
             self.declare_parameter(phase_bias_param_name, mode_info['phase_bias'], phase_bias_descriptor)
 
-            # 频率-相位偏置线性插值参数
-            phase_bias_0p6_param_name = f"{mode_key}.phase_bias_at_0p6"
-            phase_bias_0p6_descriptor = ParameterDescriptor(
-                description=f"{mode_info['name']}在0.6Hz时的相位偏置",
-                type=ParameterType.PARAMETER_DOUBLE
-            )
-            self.declare_parameter(
-                phase_bias_0p6_param_name,
-                mode_info.get("phase_bias_at_0p6", 0.0),
-                phase_bias_0p6_descriptor,
-            )
-
-            phase_bias_slope_param_name = f"{mode_key}.phase_bias_slope"
-            phase_bias_slope_descriptor = ParameterDescriptor(
-                description=f"{mode_info['name']}相位偏置线性插值斜率 (偏置/Hz)",
-                type=ParameterType.PARAMETER_DOUBLE
-            )
-            self.declare_parameter(
-                phase_bias_slope_param_name,
-                mode_info.get("phase_bias_slope", 0.0),
-                phase_bias_slope_descriptor,
-            )
-
-            event_prob_threshold_default = mode_info.get("event_prob_threshold")
-            if event_prob_threshold_default is None:
-                if mode_key == "cycling" and self.cycling_toggle_detector is not None:
-                    event_prob_threshold_default = float(
-                        getattr(
-                            self.cycling_toggle_detector,
-                            "event_prob_threshold",
-                            DEFAULT_EVENT_PROB_THRESHOLD,
-                        )
-                    )
-                else:
-                    event_prob_threshold_default = DEFAULT_EVENT_PROB_THRESHOLD
-            event_prob_threshold_default = float(
-                np.clip(event_prob_threshold_default, 0.0, 1.0)
-            )
-            self.motion_modes[mode_key]["event_prob_threshold"] = event_prob_threshold_default
-            if mode_key == "cycling" and self.cycling_toggle_detector is not None:
-                self.cycling_toggle_detector.event_prob_threshold = event_prob_threshold_default
-
-            event_prob_threshold_param_name = f"{mode_key}.event_prob_threshold"
-            event_prob_threshold_descriptor = ParameterDescriptor(
-                description=f"{mode_info['name']}的启停事件概率阈值 (0到1, 仅cycling/uphill模式生效)",
-                type=ParameterType.PARAMETER_DOUBLE,
-            )
-            self.declare_parameter(
-                event_prob_threshold_param_name,
-                event_prob_threshold_default,
-                event_prob_threshold_descriptor,
-            )
-
             swing_threshold_default = float(
                 mode_info.get("swing_threshold", DEFAULT_IMU_PHASE_SWING_THRESHOLD_DEG)
             )
@@ -1529,16 +1493,6 @@ class RealTimeGaitAnalysis(Node):
                 os.environ.get("GAIT_CYCLING_IMU_MAC", DEFAULT_CYCLING_SLOT_IMU_MAC),
             )
         )
-        threshold = float(
-            np.clip(
-                self.motion_modes.get("cycling", {}).get(
-                    "event_prob_threshold",
-                    DEFAULT_EVENT_PROB_THRESHOLD,
-                ),
-                0.0,
-                1.0,
-            )
-        )
         try:
             from .imu_cycling_toggle_detector import CyclingToggleIMUDetector
 
@@ -1546,7 +1500,6 @@ class RealTimeGaitAnalysis(Node):
                 model_path=cycling_model_path or None,
                 mac_address=cycling_imu_mac,
                 sample_rate_hz=30.0,
-                event_prob_threshold=threshold,
                 event_consecutive=int(getattr(self, "cycling_event_consecutive", 2)),
                 release_consecutive=int(getattr(self, "cycling_release_consecutive", 2)),
                 release_prob_hysteresis=float(
@@ -1746,7 +1699,7 @@ class RealTimeGaitAnalysis(Node):
     def should_measure_imu_slot(self, slot: str) -> bool:
         """Return whether a slot should stream notifications in the current motion mode."""
         slot_key = str(slot).strip().lower()
-        mode = str(getattr(self, "current_motion_mode", "walking"))
+        mode = str(getattr(self, "current_motion_mode", "imu_phase"))
         phase_keep_default = not bool(getattr(self, "imu_phase_is_wired", False))
         if mode in SINGLE_IMU_PHASE_MODES:
             return slot_key == "imu_phase_left"
@@ -1761,7 +1714,7 @@ class RealTimeGaitAnalysis(Node):
             return slot_key == "cycling"
         if mode in STAIRS_DOWN_MANUAL_MODES:
             return False
-        return slot_key == "walking"
+        return False
 
     def _imu_detector_attr_for_slot(self, slot_key: str) -> str:
         return {
@@ -1912,8 +1865,7 @@ class RealTimeGaitAnalysis(Node):
                     # 五次多项式参数列表
                     if param_type in ['ext_t0', 'ext_tf', 'ext_p', 'ext_Tmax', 
                                      'flex_t0', 'flex_tf', 'flex_p', 'flex_Tmax',
-                                     'phase_bias', 'phase_bias_at_0p6', 'phase_bias_slope',
-                                     'event_prob_threshold', 'swing_threshold']:
+                                     'phase_bias', 'swing_threshold']:
                         # 验证参数值范围
                         if param_type in ['ext_t0', 'ext_tf', 'flex_t0', 'flex_tf']:
                             # 时刻参数: 归一化相位 0-1
@@ -1972,66 +1924,6 @@ class RealTimeGaitAnalysis(Node):
                                 )
                                 return SetParametersResult(successful=False, 
                                                          reason="偏置相位参数值超出允许范围 (-1.0到1.0)")
-                        elif param_type == 'phase_bias_at_0p6':
-                            # 0.6Hz 相位偏置参数: -1 到 1
-                            if -1.0 <= param_value <= 1.0:
-                                self.motion_modes[mode_key][param_type] = param_value
-                                self.get_logger().info(
-                                    f"📊 参数更新: {self.motion_modes[mode_key]['name']} "
-                                    f"phase_bias_at_0p6 = {param_value:.3f}"
-                                )
-                            else:
-                                self.get_logger().warn(
-                                    f"0.6Hz相位偏置超出范围 (-1.0到1.0): {param_name} = {param_value}"
-                                )
-                                return SetParametersResult(successful=False,
-                                                         reason="0.6Hz相位偏置超出允许范围 (-1.0到1.0)")
-                        elif param_type == 'phase_bias_slope':
-                            # 线性插值斜率: -10 到 10 (偏置/Hz)
-                            if -10.0 <= param_value <= 10.0:
-                                self.motion_modes[mode_key][param_type] = param_value
-                                self.get_logger().info(
-                                    f"📊 参数更新: {self.motion_modes[mode_key]['name']} "
-                                    f"phase_bias_slope = {param_value:.3f}"
-                                )
-                            else:
-                                self.get_logger().warn(
-                                    f"线性插值斜率超出范围 (-10.0到10.0): {param_name} = {param_value}"
-                                )
-                                return SetParametersResult(successful=False,
-                                                         reason="线性插值斜率超出允许范围 (-10.0到10.0)")
-                        elif param_type == 'event_prob_threshold':
-                            # cycling/uphill 启停事件概率阈值: 0 到 1
-                            if 0.0 <= param_value <= 1.0:
-                                self.motion_modes[mode_key][param_type] = param_value
-                                detector = getattr(self, "cycling_toggle_detector", None)
-                                if (
-                                    mode_key in CYCLING_TOGGLE_MODES
-                                    and mode_key not in IMU_PHASE_MODES
-                                    and detector is not None
-                                    and self.current_motion_mode == mode_key
-                                ):
-                                    detector.event_prob_threshold = float(param_value)
-                                    self.get_logger().info(
-                                        f"📊 参数更新: {self.motion_modes[mode_key]['name']} "
-                                        f"event_prob_threshold = {param_value:.3f} (当前模式已生效)"
-                                    )
-                                elif mode_key in CYCLING_TOGGLE_MODES and mode_key not in IMU_PHASE_MODES:
-                                    self.get_logger().info(
-                                        f"📊 参数更新: {self.motion_modes[mode_key]['name']} "
-                                        f"event_prob_threshold = {param_value:.3f} (切换到该模式后生效)"
-                                    )
-                                else:
-                                    self.get_logger().info(
-                                        f"📊 参数更新: {self.motion_modes[mode_key]['name']} "
-                                        f"event_prob_threshold = {param_value:.3f} (当前模式不使用)"
-                                    )
-                            else:
-                                self.get_logger().warn(
-                                    f"启停事件概率阈值超出范围 (0.0到1.0): {param_name} = {param_value}"
-                                )
-                                return SetParametersResult(successful=False,
-                                                         reason="启停事件概率阈值超出允许范围 (0.0到1.0)")
                         elif param_type == 'swing_threshold':
                             # IMU相位摆幅阈值: 0 到 90 deg
                             if 0.0 <= param_value <= 90.0:
@@ -2043,6 +1935,8 @@ class RealTimeGaitAnalysis(Node):
                                         self.imu_left_hip_style_phase_estimator.update_swing_threshold(param_value)
                                     self.imu_phase_right_estimator.update_swing_threshold(param_value)
                                     self.imu_phase_diff_estimator.update_swing_threshold(param_value)
+                                    if hasattr(self, "imu_phase_diff_hip_style_estimator"):
+                                        self.imu_phase_diff_hip_style_estimator.update_swing_threshold(param_value)
                                     effect = "当前模式已生效" if self.current_motion_mode == mode_key else "切换到该模式后生效"
                                 elif mode_key in MODEL_PHASE_MODES:
                                     effect = "模型相位模式不使用"
@@ -2081,25 +1975,13 @@ class RealTimeGaitAnalysis(Node):
             print(f"   - 屈曲结束相位: {current_params['flex_tf']:.2f}")
             print(f"   - 屈曲最大力矩: {current_params['flex_Tmax']:.2f} Nm")
             print(f"   - 偏置相位: {current_params['phase_bias']:.3f}")
-            print(
-                f"   - 启停事件阈值: "
-                f"{float(current_params.get('event_prob_threshold', DEFAULT_EVENT_PROB_THRESHOLD)):.3f}"
-            )
             if mode not in STAIRS_DOWN_MANUAL_MODES:
                 self.stairs_down_manual_assist_enabled = False
 
             if mode in CYCLING_TOGGLE_MODES and mode not in IMU_PHASE_MODES:
                 self._ensure_imu_detector_for_slot("cycling")
                 detector = getattr(self, "cycling_toggle_detector", None)
-                threshold = float(
-                    np.clip(
-                        current_params.get("event_prob_threshold", DEFAULT_EVENT_PROB_THRESHOLD),
-                        0.0,
-                        1.0,
-                    )
-                )
                 if detector is not None:
-                    detector.event_prob_threshold = threshold
                     detector.reset_toggle_state(assist_enabled=False)
                 self.assist_enable = False
                 self.assist_wait_next_zero = False
@@ -2107,7 +1989,6 @@ class RealTimeGaitAnalysis(Node):
                 self.gait_state = 0
                 self.reset_phase_estimator()
                 print(f"   - {mode}启停状态: 静默（等待脚部IMU识别到“启停”事件）")
-                print(f"   - {mode}模型阈值: {threshold:.3f}")
                 return True
 
             if mode in MODEL_PHASE_MODES:
@@ -2148,6 +2029,8 @@ class RealTimeGaitAnalysis(Node):
                     self.imu_left_hip_style_phase_estimator.update_swing_threshold(threshold)
                 self.imu_phase_right_estimator.update_swing_threshold(threshold)
                 self.imu_phase_diff_estimator.update_swing_threshold(threshold)
+                if hasattr(self, "imu_phase_diff_hip_style_estimator"):
+                    self.imu_phase_diff_hip_style_estimator.update_swing_threshold(threshold)
                 source_text = str(getattr(self, "imu_phase_source_label", "大腿IMU"))
                 if mode in IMU_AO_PHASE_MODES and mode in SINGLE_IMU_PHASE_MODES:
                     print(
@@ -2161,6 +2044,11 @@ class RealTimeGaitAnalysis(Node):
                     )
                 elif mode in SINGLE_IMU_PHASE_MODES:
                     print(f"   - 相位来源: 左{source_text}，右腿相位=左腿相位+pi")
+                elif mode in HIP_STYLE_DIFF_PHASE_MODES:
+                    print(
+                        f"   - 相位来源: 左{source_text}-右{source_text}矢状面角度/角速度差值 "
+                        "+ hip-style相位估计，右腿相位=左腿相位+pi"
+                    )
                 else:
                     print(
                         f"   - 相位来源: 左{source_text}-右{source_text}矢状面角度/角速度差值，"
@@ -2179,7 +2067,6 @@ class RealTimeGaitAnalysis(Node):
                 self.reset_phase_estimator()
                 print(f"   - {mode}启停状态: 手动按钮控制（默认关闭）")
                 return True
-            self._ensure_imu_detector_for_slot("walking")
             return True
         else:
             print(f"❌ 错误: 未知运动模式 '{mode}'")
@@ -2610,78 +2497,8 @@ class RealTimeGaitAnalysis(Node):
         return False
 
     def _update_phase_bias_auto(self):
-        """walking/cycling 模式下，在周期开始前的零助力点更新 phase_bias。"""
-        if self.current_motion_mode in IMU_PHASE_MODES:
-            return
-        if self.current_motion_mode not in ("walking", "cycling"):
-            return
-        if not getattr(self, "phase_active", False):
-            self._bias_cycle_prev_phase = None
-            self._bias_cycle_update_done = False
-            return
-        phase = getattr(self, "current_left_phase", None)
-        if phase is None:
-            return
-        prev_phase = self._bias_cycle_prev_phase
-        if prev_phase is not None and phase - prev_phase < -np.pi:
-            self._bias_cycle_update_done = False
-        self._bias_cycle_prev_phase = phase
-        if prev_phase is None or self._bias_cycle_update_done:
-            return
-
-        mode_key = self.current_motion_mode
-        params = self.get_current_assist_parameters()
-        zero_start = self._get_pre_cycle_zero_start(params)
-        if zero_start is None:
-            return
-        phase_norm = (phase % (2 * np.pi)) / (2 * np.pi)
-        phase_assist = (phase_norm + params["phase_bias"]) % 1.0
-        if phase_assist < zero_start:
-            return
-        torque = self._calculate_hip_assist_quintic(phase_norm, params)
-        if abs(float(torque)) > 1e-6:
-            return
-
-        freq = self._get_freq_for_bias()
-        if freq is None:
-            return
-        prev_bias = self.motion_modes[mode_key].get("phase_bias", self.dynamic_phase_bias)
-        last_freq = getattr(self, "_last_freq_for_bias", None)
-        linear_bias_at_0p6 = self.motion_modes[mode_key].get("phase_bias_at_0p6")
-        linear_slope = self.motion_modes[mode_key].get("phase_bias_slope")
-        new_bias = phase_bias_with_smoothing(
-            freq_hz=freq,
-            prev_bias=prev_bias,
-            dt=self.dt,
-            mode_key=mode_key,
-            linear_bias_at_0p6=linear_bias_at_0p6,
-            linear_slope=linear_slope,
-            last_freq_hz=last_freq,
-        )
-        if abs(new_bias - prev_bias) < 1e-4:
-            self._last_freq_for_bias = freq
-            self._bias_cycle_update_done = True
-            return
-        self._last_freq_for_bias = freq
-        self._bias_cycle_update_done = True
-        self.motion_modes[mode_key]["phase_bias"] = new_bias
-        self.dynamic_phase_bias = new_bias
-        if self.debug_mode:
-            self.get_logger().info(
-                f"🎚️ 相位偏置自适应: freq={freq:.2f}Hz prev={prev_bias:.3f} -> new={new_bias:.3f}"
-            )
-        try:
-            msg = Float32()
-            msg.data = float(new_bias)
-            self.phase_bias_pub.publish(msg)
-        except Exception:
-            pass
-        try:
-            self.set_parameters(
-                [Parameter(f"{self.current_motion_mode}.phase_bias", value=new_bias)]
-            )
-        except Exception:
-            pass
+        """保留兼容入口；当前保留模式均使用固定 phase_bias，不再自动插值。"""
+        return
     
     def sync_oscillator_frequency(self):
         """
@@ -3151,8 +2968,9 @@ class RealTimeGaitAnalysis(Node):
             self.phase_preview_angle_sq.clear()
         if hasattr(self, "phase_preview_dq_sq"):
             self.phase_preview_dq_sq.clear()
-        if hasattr(self, "test_mode_phase_tracker"):
-            self.test_mode_phase_tracker.reset(
+        tracker = getattr(self, "test_mode_phase_tracker", None)
+        if tracker is not None:
+            tracker.reset(
                 estimated_human_frequency=float(getattr(self, "estimated_human_frequency", 1.0)),
                 keep_period=False,
             )
@@ -3170,6 +2988,8 @@ class RealTimeGaitAnalysis(Node):
             self.imu_left_hip_style_phase_estimator.reset()
         if hasattr(self, "imu_phase_diff_estimator"):
             self.imu_phase_diff_estimator.reset()
+        if hasattr(self, "imu_phase_diff_hip_style_estimator"):
+            self.imu_phase_diff_hip_style_estimator.reset()
         self.imu_phase_last_left_seq = 0
         self.imu_phase_last_right_seq = 0
         self.imu_phase_last_diff_left_seq = 0
@@ -3791,6 +3611,7 @@ class RealTimeGaitAnalysis(Node):
         ao_phase_mode = self.current_motion_mode in IMU_AO_PHASE_MODES
         single_imu_mode = self.current_motion_mode in SINGLE_IMU_PHASE_MODES
         dual_diff_mode = self.current_motion_mode in DUAL_IMU_PHASE_MODES
+        hip_style_diff_mode = self.current_motion_mode in HIP_STYLE_DIFF_PHASE_MODES
         imu_phase_acc_angle_mode = self.current_motion_mode in (*DUAL_IMU_PHASE_MODES, *SINGLE_IMU_PHASE_MODES)
         left_estimator = (
             self.imu_left_hip_style_phase_estimator
@@ -3799,7 +3620,7 @@ class RealTimeGaitAnalysis(Node):
         )
         left_angle_source_override = (
             None
-            if self.current_motion_mode == "imu_left_phase"
+            if self.current_motion_mode == "imu_left_phase" or hip_style_diff_mode
             else "acc"
             if imu_phase_acc_angle_mode
             else None
@@ -3816,7 +3637,13 @@ class RealTimeGaitAnalysis(Node):
             getattr(self, "imu_phase_right_detector", None),
             self.imu_phase_right_estimator,
             use_adaptive_oscillator=False,
-            angle_source_override="acc" if imu_phase_acc_angle_mode else None,
+            angle_source_override=(
+                None
+                if hip_style_diff_mode
+                else "acc"
+                if imu_phase_acc_angle_mode
+                else None
+            ),
         )
         left_rejected = bool(left_output is not None and getattr(left_output, "sample_rejected", False))
         right_rejected = bool(right_output is not None and getattr(right_output, "sample_rejected", False))
@@ -3830,6 +3657,11 @@ class RealTimeGaitAnalysis(Node):
         diff_new_sample = False
         diff_angle_raw_deg = 0.0
         diff_gyro_raw_deg_s = 0.0
+        diff_estimator = (
+            self.imu_phase_diff_hip_style_estimator
+            if hip_style_diff_mode
+            else self.imu_phase_diff_estimator
+        )
         if (
             dual_diff_mode
             and left_output is not None
@@ -3896,19 +3728,19 @@ class RealTimeGaitAnalysis(Node):
                             "deg",
                         )
 
-                diff_output = self.imu_phase_diff_estimator.process_signal(
+                diff_output = diff_estimator.process_signal(
                     diff_angle_raw_deg,
                     diff_gyro_raw_deg_s,
                     diff_time,
                 )
-                if not ao_phase_mode:
+                if not ao_phase_mode and not hip_style_diff_mode:
                     diff_output = self._apply_seeded_imu_diff_phase(diff_output, diff_time)
                 if ao_phase_mode:
                     diff_output = self._process_imu_adaptive_oscillator_side(
                         "diff",
                         diff_output,
                         diff_time,
-                        self.imu_phase_diff_estimator,
+                        diff_estimator,
                     )
                 self.imu_phase_last_diff_left_seq = left_seq
                 self.imu_phase_last_diff_right_seq = right_seq
@@ -3930,15 +3762,26 @@ class RealTimeGaitAnalysis(Node):
                 diff_output is not None
                 and self.gait_state == 1
                 and not ao_phase_mode
+                and not hip_style_diff_mode
                 and not diff_rejected
                 and bool(getattr(self, "_imu_diff_start_seeded", False))
                 and int(getattr(diff_output, "zero_event_count", 0)) == 0
                 and bool(getattr(diff_output, "recent_swing_active", False))
             )
+            temporary_diff_valid = bool(
+                diff_output is not None
+                and hip_style_diff_mode
+                and getattr(diff_output, "temporary_phase_active", False)
+            )
             diff_valid = bool(
                 diff_output is not None
                 and not diff_rejected
-                and (ao_phase_mode or diff_output.zero_event_count > 0 or seeded_diff_valid)
+                and (
+                    ao_phase_mode
+                    or diff_output.zero_event_count > 0
+                    or seeded_diff_valid
+                    or temporary_diff_valid
+                )
             )
             diff_motion_active = bool(diff_output is not None and diff_output.motion_active and not diff_rejected)
             self.imu_phase_left_valid = diff_valid

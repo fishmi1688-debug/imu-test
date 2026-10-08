@@ -14,10 +14,10 @@ from .imu_model_start_stop_detector import IMUModelStartStopDetector
 
 DEFAULT_CYCLING_IMU_MAC = "D4:22:CD:00:8A:5B"
 DEFAULT_CYCLING_MODEL_PATH = Path(__file__).resolve().parent / "model" / "model_cycling.joblib"
-# 事件概率阈值（模型输出“启停”概率 >= 该值时视为一次启停事件）
+# 翻转概率阈值（模型输出“启停”概率 >= 该值时视为一次启停事件）
 # 调大: 更保守，误触发更少，但可能漏检真实启停
 # 调小: 更灵敏，更容易触发翻转，也更容易误触发
-DEFAULT_EVENT_PROB_THRESHOLD = 0.8
+DEFAULT_TOGGLE_PROB_THRESHOLD = 0.8
 # 触发翻转所需连续“启停”事件窗口数
 # 调大: 抗噪更强，但翻转响应更慢
 # 调小: 翻转更快，但抖动风险更高
@@ -26,7 +26,7 @@ DEFAULT_EVENT_CONSECUTIVE = 2
 # 调大: 更不容易重复触发同一事件，但下一次新事件响应会稍慢
 # 调小: 释放更快，可能在边界噪声下重复翻转
 DEFAULT_RELEASE_CONSECUTIVE = 2
-# 释放滞回：解锁阈值 = event_prob_threshold - release_prob_hysteresis
+# 释放滞回：解锁阈值 = toggle_prob_threshold - release_prob_hysteresis
 # 调大: 更抗抖动，阈值附近不易反复翻转；但“下一次新事件”响应略慢
 # 调小: 更灵敏，但更容易在边界概率附近抖动
 DEFAULT_RELEASE_PROB_HYSTERESIS = 0.10
@@ -40,7 +40,7 @@ class CyclingToggleIMUDetector(IMUModelStartStopDetector):
         model_path: Optional[str] = None,
         mac_address: str = DEFAULT_CYCLING_IMU_MAC,
         sample_rate_hz: float = 30.0,
-        event_prob_threshold: float = DEFAULT_EVENT_PROB_THRESHOLD,
+        toggle_prob_threshold: float = DEFAULT_TOGGLE_PROB_THRESHOLD,
         event_consecutive: int = DEFAULT_EVENT_CONSECUTIVE,
         release_consecutive: int = DEFAULT_RELEASE_CONSECUTIVE,
         release_prob_hysteresis: float = DEFAULT_RELEASE_PROB_HYSTERESIS,
@@ -57,9 +57,9 @@ class CyclingToggleIMUDetector(IMUModelStartStopDetector):
             data_timeout_sec=data_timeout_sec,
             connect_timeout_sec=connect_timeout_sec,
             reconnect_interval_sec=reconnect_interval_sec,
-            walk_prob_threshold=event_prob_threshold,
+            walk_prob_threshold=toggle_prob_threshold,
         )
-        self.event_prob_threshold = float(np.clip(event_prob_threshold, 0.0, 1.0))
+        self.toggle_prob_threshold = float(np.clip(toggle_prob_threshold, 0.0, 1.0))
         self.event_consecutive = max(1, int(event_consecutive))
         self.release_consecutive = max(1, int(release_consecutive))
         self.release_prob_hysteresis = float(np.clip(release_prob_hysteresis, 0.0, 1.0))
@@ -116,10 +116,10 @@ class CyclingToggleIMUDetector(IMUModelStartStopDetector):
             info["sample_rate_hz"] = self.sample_rate_hz
             info["window_size"] = self._window_size
             info["step"] = self._step
-            info["event_prob_threshold"] = self.event_prob_threshold
+            info["toggle_prob_threshold"] = self.toggle_prob_threshold
             info["release_prob_hysteresis"] = self.release_prob_hysteresis
             info["release_threshold"] = max(
-                0.0, float(self.event_prob_threshold - self.release_prob_hysteresis)
+                0.0, float(self.toggle_prob_threshold - self.release_prob_hysteresis)
             )
             info["event_consecutive"] = self.event_consecutive
             info["release_consecutive"] = self.release_consecutive
@@ -149,9 +149,9 @@ class CyclingToggleIMUDetector(IMUModelStartStopDetector):
 
         raw_pred_id, event_prob = self._infer_window(window)
         release_threshold = max(
-            0.0, float(self.event_prob_threshold - self.release_prob_hysteresis)
+            0.0, float(self.toggle_prob_threshold - self.release_prob_hysteresis)
         )
-        is_event = event_prob >= self.event_prob_threshold
+        is_event = event_prob >= self.toggle_prob_threshold
         is_release_candidate = event_prob <= release_threshold
         toggle_triggered = False
 

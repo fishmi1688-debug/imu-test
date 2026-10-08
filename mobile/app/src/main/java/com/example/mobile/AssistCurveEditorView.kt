@@ -19,7 +19,6 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sin
-import kotlin.math.sqrt
 
 class AssistCurveEditorView @JvmOverloads constructor(
     context: Context,
@@ -86,6 +85,7 @@ class AssistCurveEditorView @JvmOverloads constructor(
     )
 
     private var activeTarget = DragTarget.NONE
+    private var phaseBiasDragStarted = false
     private var leftWiredImuPhaseBiasStyle = false
     private val gridPathEffect = DashPathEffect(floatArrayOf(dp(4f), dp(4f)), 0f)
     private val helperPath = Path()
@@ -277,7 +277,10 @@ class AssistCurveEditorView @JvmOverloads constructor(
                 }
                 parent?.requestDisallowInterceptTouchEvent(true)
                 activeTarget = target
-                updateTarget(event.x, event.y, geometry)
+                phaseBiasDragStarted = false
+                if (target != DragTarget.PHASE_BIAS) {
+                    updateTarget(event.x, event.y, geometry)
+                }
                 invalidate()
                 return true
             }
@@ -287,6 +290,9 @@ class AssistCurveEditorView @JvmOverloads constructor(
                     return super.onTouchEvent(event)
                 }
                 parent?.requestDisallowInterceptTouchEvent(true)
+                if (activeTarget == DragTarget.PHASE_BIAS) {
+                    phaseBiasDragStarted = true
+                }
                 updateTarget(event.x, event.y, geometry)
                 invalidate()
                 return true
@@ -296,8 +302,11 @@ class AssistCurveEditorView @JvmOverloads constructor(
                 if (activeTarget == DragTarget.NONE) {
                     return super.onTouchEvent(event)
                 }
-                updateTarget(event.x, event.y, geometry)
+                if (activeTarget != DragTarget.PHASE_BIAS || phaseBiasDragStarted) {
+                    updateTarget(event.x, event.y, geometry)
+                }
                 activeTarget = DragTarget.NONE
+                phaseBiasDragStarted = false
                 parent?.requestDisallowInterceptTouchEvent(false)
                 invalidate()
                 performClick()
@@ -307,6 +316,7 @@ class AssistCurveEditorView @JvmOverloads constructor(
             MotionEvent.ACTION_CANCEL -> {
                 if (activeTarget != DragTarget.NONE) {
                     activeTarget = DragTarget.NONE
+                    phaseBiasDragStarted = false
                     parent?.requestDisallowInterceptTouchEvent(false)
                     invalidate()
                     return true
@@ -645,7 +655,7 @@ class AssistCurveEditorView @JvmOverloads constructor(
             }
         }
 
-        if (isNearPhaseOval(x, y, geometry)) {
+        if (isNearPhaseBiasHandle(x, y, geometry)) {
             return DragTarget.PHASE_BIAS
         }
 
@@ -882,18 +892,12 @@ class AssistCurveEditorView @JvmOverloads constructor(
         return ratio
     }
 
-    private fun isNearPhaseOval(x: Float, y: Float, geometry: Geometry): Boolean {
-        val oval = geometry.phaseOvalRect
-        val radiusX = oval.width() * 0.5f
-        val radiusY = oval.height() * 0.5f
-        if (radiusX <= 0f || radiusY <= 0f) {
-            return false
-        }
-        val scaledX = ((x - oval.centerX()) / radiusX).toDouble()
-        val scaledY = ((y - oval.centerY()) / radiusY).toDouble()
-        val normalizedDistance = sqrt(scaledX * scaledX + scaledY * scaledY)
-        val hitBand = (dp(22f) / min(radiusX, radiusY)).coerceAtLeast(0.32f)
-        return abs(normalizedDistance - 1.0) <= hitBand
+    private fun isNearPhaseBiasHandle(x: Float, y: Float, geometry: Geometry): Boolean {
+        val handlePoint = phaseBiasHandlePoint(geometry)
+        val dx = handlePoint.first - x
+        val dy = handlePoint.second - y
+        val touchRadius = dp(18f)
+        return dx * dx + dy * dy <= touchRadius * touchRadius
     }
 
     private fun displayToBasePhase(x: Float, geometry: Geometry): Double {
