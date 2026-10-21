@@ -117,6 +117,7 @@ IMU_PHASE_ANGLE_LPF_CUTOFF_HZ = 6.0  # 大腿矢状面角度/角速度一阶低�
 DIFF_TEST_MOTOR_ANGLE_LPF_CUTOFF_HZ = 4.0  # 差分测试模式电机角度一阶低通截止频率
 IMU_PHASE_DISPLAY_MAX_ANGLE_JUMP_DEG = 45.0  # 仅用于APP/日志显示的角度跳变保持阈值
 IMU_PHASE_DISPLAY_MAX_GYRO_JUMP_DEG_S = 900.0  # 仅用于APP/日志显示的角速度跳变保持阈值
+ASSIST_START_ZERO_TORQUE_EPS_NM = 1e-6  # 按实际助力曲线零点放行，避免在非零力矩处接入
 
 # 停止->运动切换时的起步初始相位参数（便于现场快速调参）
 START_PHASE_INIT_LEFT_FIRST = 0.0    # 左脚先迈时，左腿相位初始值（rad）
@@ -891,6 +892,7 @@ class RealTimeGaitAnalysis(Node):
         self.actual_right_torque = 0.0
         self.assist_wait_next_zero = False  # 运动判定后等待下一个相位零点再启动助力
         self._assist_zero_prev_phase = None  # 零点检测用上一时刻相位
+        self._reset_assist_curve_start()
         self._start_phase_init_pending = False
         self._start_phase_init_value = START_PHASE_INIT_LEFT_FIRST
         self._start_phase_init_side = "left"
@@ -2092,6 +2094,8 @@ class RealTimeGaitAnalysis(Node):
         self.stairs_down_manual_assist_enabled = target
         self.assist_wait_next_zero = False
         self._assist_zero_prev_phase = None
+        if changed:
+            self._reset_assist_curve_start()
 
         if target:
             if self.current_motion_mode in MOTOR_PEAK_PHASE_MODES:
@@ -2236,6 +2240,52 @@ class RealTimeGaitAnalysis(Node):
         
         return torque
     
+    def _reset_assist_curve_start(self):
+        """停止、切换模式或重新启用后，左右侧分别等待助力曲线零点。"""
+        self._assist_curve_start_ready = {"left": False, "right": False}
+        self._assist_curve_start_prev_phase = {"left": None, "right": None}
+        self.assist_curve_start_hold = {"left": True, "right": True}
+        self.assist_wait_next_zero = False
+
+    def _crossed_assist_curve_zero(self, previous_phase, phase, params):
+        """检测前进相位段内的曲线零区/过零，支持偏置、跨周期和窗口重叠。"""
+        distance = (phase - previous_phase) % 1.0
+        # 相位倒退或大幅跳变不作为经过零点的依据。
+        if distance <= 1e-9 or distance > 0.5:
+            return False
+        offsets = list(np.linspace(0.0, distance, 17))
+        bias = float(params["phase_bias"])
+        for key in ("ext_t0", "ext_tf", "flex_t0", "flex_tf"):
+            boundary = (float(params[key]) - bias) % 1.0
+            offset = (boundary - previous_phase) % 1.0
+            if 0.0 < offset <= distance + 1e-9:
+                offsets.append(min(offset, distance))
+        phases = previous_phase + np.asarray(sorted(set(offsets)))
+        torques = np.asarray(self._calculate_hip_assist_quintic(phases, params), dtype=float)
+        return bool(
+            np.any(np.abs(torques) <= ASSIST_START_ZERO_TORQUE_EPS_NM)
+            or np.any(torques[:-1] * torques[1:] < 0.0)
+        )
+
+    def _gate_assist_curve_start(self, side, phase, torque, params):
+        """零点放行当帧仍输出零，随后直接沿用原助力曲线。"""
+        self.assist_curve_start_hold[side] = False
+        if self._assist_curve_start_ready[side]:
+            return float(torque)
+        phase = float(phase) % 1.0
+        previous_phase = self._assist_curve_start_prev_phase[side]
+        self._assist_curve_start_prev_phase[side] = phase
+        self.assist_curve_start_hold[side] = True
+        at_zero = abs(float(torque)) <= ASSIST_START_ZERO_TORQUE_EPS_NM
+        crossed_zero = previous_phase is not None and self._crossed_assist_curve_zero(
+            previous_phase, phase, params
+        )
+        if at_zero or crossed_zero:
+            self._assist_curve_start_ready[side] = True
+            label = "左腿" if side == "left" else "右腿"
+            self.get_logger().info(f"🟢 {label}到达助力曲线零点，随后按曲线输出助力")
+        return 0.0
+
     def _compute_external_phase(self, theta, dtheta, theta_mean):
         """
         根据角度和角速度构造外部观测相位 psi。
@@ -2942,6 +2992,7 @@ class RealTimeGaitAnalysis(Node):
 
     def reset_phase_estimator(self):
         """将相位估计重置为初始未使用状态，并重置振荡器参数"""
+        self._reset_assist_curve_start()
         self.phase_active = False
         self.phi_L = 0.0
         self.current_left_phase = 0.0
@@ -3894,16 +3945,6 @@ class RealTimeGaitAnalysis(Node):
             self._update_phase_rate_frequency(None)
             self._update_phase_peak_frequency(None)
 
-        if (
-            self.gait_state == 1
-            and getattr(self, "assist_wait_next_zero", False)
-            and bool(getattr(self, "imu_phase_left_zero_event", False))
-            and self.imu_phase_valid
-        ):
-            self.assist_wait_next_zero = False
-            self.assist_enable = True
-            self.get_logger().info("IMU相位到达左腿零点，开始输出助力")
-
         if not hasattr(self, 'left_phase_buffer'):
             self.left_phase_buffer = deque(maxlen=self.buffer_size)
             self.right_phase_buffer = deque(maxlen=self.buffer_size)
@@ -4295,6 +4336,23 @@ class RealTimeGaitAnalysis(Node):
                     else "相位未激活或助力关闭"
                 )
                 self.get_logger().info(f"🛑 步态检测：{reason}，助力输出置零")
+
+        if self.current_motion_mode in IMU_PHASE_MODES:
+            if (
+                not self.assist_enable
+                or not getattr(self, "phase_active", False)
+                or imu_phase_motion_inactive
+                or imu_phase_abnormal
+            ):
+                self._reset_assist_curve_start()
+            else:
+                left_torque = self._gate_assist_curve_start(
+                    "left", left_phase_normalized, left_torque, params
+                )
+                right_torque = self._gate_assist_curve_start(
+                    "right", right_phase_normalized, right_torque, params
+                )
+                self.assist_wait_next_zero = not all(self._assist_curve_start_ready.values())
 
         imu_left_startup_ramp_scale = 1.0
         if self.current_motion_mode == "imu_left_phase":

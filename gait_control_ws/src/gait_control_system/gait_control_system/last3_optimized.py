@@ -74,7 +74,7 @@ def _wait_for_dual_motor_feedback(
     timeout_sec: float = 1.0,
     poll_interval_sec: float = 0.05,
 ) -> bool:
-    """Wait for both motors to report periodic RS01 feedback frames."""
+    """Wait for both motors to report periodic RS02 feedback frames."""
     timeout_sec = max(float(timeout_sec), 0.05)
     poll_interval_sec = max(float(poll_interval_sec), 0.01)
     deadline = time.time() + timeout_sec
@@ -197,7 +197,7 @@ def main():
         print("\n🦾 关节助力系统已启动")
         print("="*50)
         print("⚠️ 重要提示:")
-        print("   1. 当前按 RS01 私有运控 CAN 协议通信")
+        print("   1. 当前按 RS02 私有运控 CAN 协议通信")
         print("   2. 左电机 CAN ID=1，右电机 CAN ID=2")
         print("   3. 开机默认平地行走(walking)会自动启动助力，不等待手机连接")
         print("   4. 手机切换模式后助力会先停止，需由APP重新点击开始/手动助力")
@@ -1261,7 +1261,8 @@ def main():
                 active_report=motor_active_report,
             )
         )
-        zero_ok = bool(left_ok and right_ok and motor_controller.execute_mechanical_zero())
+        # 沿用 RS02 已预设的固定零点，自动启动不发送机械标零命令。
+        zero_ok = bool(motor_controller.mechanical_zeroed)
         feedback_ok = True
         reason = ""
         if not left_ok or not right_ok:
@@ -2525,7 +2526,8 @@ def main():
                             active_report=motor_active_report,
                         )
                     )
-                    zero_ok = bool(left_ok and right_ok and motor_controller.execute_mechanical_zero())
+                    # APP 开始助力也沿用固定零点，避免改写电机的零位。
+                    zero_ok = bool(motor_controller.mechanical_zeroed)
                     reason = ""
                     enabled = bool(getattr(gait_analysis, "assist_enable", False))
 
@@ -2755,8 +2757,8 @@ def main():
             imu_phase_mode = current_motion_mode in IMU_PHASE_MODES
             _sync_motor_active_report_for_mode()
             motor_feedback_mode = bool(app_runtime_enabled and not imu_phase_mode)
-            if motor_feedback_mode:
-                motor_controller.poll_feedback(timeout=0.001, max_messages=50)
+            # 所有模式持续读取电机应答用于监控，IMU相位仍使用独立的IMU样本。
+            motor_controller.monitor_feedback(now=current_time, expected=app_runtime_enabled)
 
             lhip_angle, lhip_velocity = None, None
             rhip_angle, rhip_velocity = None, None
@@ -3099,6 +3101,7 @@ def main():
                     gait_analysis.fast_static_stop_active = bool(fast_static_stop_now)
                     if fast_static_stop_now and imu_phase_mode:
                         gait_analysis.imu_phase_motion_active = False
+                        gait_analysis._reset_assist_curve_start()
                 
                 # 使用独立计算的左右电机助力力矩
                 if mechanical_zero_ready and gait_analysis.left_hipAss and gait_analysis.right_hipAss:
@@ -3310,6 +3313,13 @@ def main():
                         filtered_left_torque = smoothed_left_torque
                         filtered_right_torque = smoothed_right_torque
                     last_torque_filter_time = current_time
+                # 等待曲线零点及放行当帧时清除滤波残值，保证从零助力接入。
+                if imu_phase_mode:
+                    start_hold = gait_analysis.assist_curve_start_hold
+                    if start_hold["left"]:
+                        filtered_left_torque = 0.0
+                    if start_hold["right"]:
+                        filtered_right_torque = 0.0
                 last_left_motor_torque = filtered_left_torque
                 last_right_motor_torque = filtered_right_torque
                 
